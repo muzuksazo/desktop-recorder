@@ -1,0 +1,11 @@
+[package]
+name = "recorder-app"
+version = "0.1.0"
+edition = "2021"
+description = "실시간 전사 화면 (GPUI). Python 백엔드(../backend.py)를 실행해 결과를 보여 준다"
+
+[dependencies]
+futures = "0.3"
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
