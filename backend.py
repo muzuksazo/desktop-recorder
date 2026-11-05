@@ -94,7 +94,9 @@ class Segmenter(threading.Thread):
         vad = load_silero_vad(onnx=False)
         a = self.args
         fdur = VAD_FRAME / SAMPLE_RATE
-        pre_frames = int(0.5 / fdur)                 # 말 시작 전 0.5초도 넣는다 (첫 음절 보호)
+        # 말 시작 전 0.3초를 넣는다. 시험 결과: 0.1~0.2초는 첫 단어가 뭉개지고("경쟁률"→"경진"),
+        # 0.5초 이상 무음이 앞에 붙으면 모델이 첫 단어("근데")를 아예 빼먹는다.
+        pre_frames = int(0.3 / fdur)
         end_frames = max(1, int(a.pause / fdur))     # 이만큼 조용하면 문장 끝
         max_frames = int(a.max_seg / fdur)
         min_frames = int(0.4 / fdur)                 # 말소리가 0.4초도 안 되면 버림 (기침, 클릭)
