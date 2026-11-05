@@ -107,13 +107,13 @@ def pick_device(requested):
     return dev, dtype
 
 
-def load_model(device_arg):
+def load_model(device_arg, model_id=MODEL_ID):
     from qwen_asr import Qwen3ASRModel
 
     dev, dtype = pick_device(device_arg)
     print(f"모델 로딩 중... (device={dev}, dtype={dtype})")
     model = Qwen3ASRModel.from_pretrained(
-        MODEL_ID,
+        model_id,
         dtype=dtype,
         device_map=dev,
         max_inference_batch_size=1,
@@ -149,7 +149,7 @@ class Transcriber(threading.Thread):
     def run(self):
         args = self.args
         try:
-            model, dev = load_model(args.device)
+            model, dev = load_model(args.device, getattr(args, "model", None) or MODEL_ID)
         except Exception as e:
             self.ui_q.put(("error", f"모델 로딩 실패: {e}"))
             return

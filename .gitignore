@@ -4,3 +4,4 @@ __pycache__/
 venv/
 transcript_*.txt
 .env
+target/
