@@ -4254,8 +4254,11 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 name = "recorder-app"
 version = "0.1.0"
 dependencies = [
+ "cocoa 0.26.0",
  "futures",
  "gpui",
+ "objc",
+ "raw-window-handle",
  "serde",
  "serde_json",
 ]

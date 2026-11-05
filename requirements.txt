@@ -3,3 +3,5 @@ torch
 numpy
 soundfile
 soundcard>=0.4.3
+qwen3-asr-mlx; sys_platform == 'darwin' and platform_machine == 'arm64'
+mlx; sys_platform == 'darwin' and platform_machine == 'arm64'
