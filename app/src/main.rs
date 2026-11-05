@@ -49,7 +49,7 @@ fn spawn_backend(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
         .args(["-X", "utf8"])
         .arg(&script)
         .args(env::args().skip(1)) // 앱 옵션을 그대로 백엔드에
-        .stdin(Stdio::piped()) // 앱이 끝나면 닫혀서 백엔드도 끝난다
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit()) // 백엔드 로그는 터미널에
         .spawn()?;
@@ -77,8 +77,17 @@ struct TranscriptView {
     /// (내용, 오류 여부)
     lines: Vec<(SharedString, bool)>,
     scroll: ScrollHandle,
-    /// 들고 있어야 stdin 이 열려 있다 (앱이 끝나면 닫힘 → 백엔드 종료)
-    _backend: Option<Child>,
+    backend: Option<Child>,
+}
+
+impl Drop for TranscriptView {
+    /// 창이 닫히면 백엔드도 끈다
+    fn drop(&mut self) {
+        if let Some(mut child) = self.backend.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl TranscriptView {
@@ -88,10 +97,10 @@ impl TranscriptView {
             status: vec!["백엔드 시작 중…".into()],
             lines: Vec::new(),
             scroll: ScrollHandle::new(),
-            _backend: None,
+            backend: None,
         };
         match spawn_backend(tx) {
-            Ok(child) => view._backend = Some(child),
+            Ok(child) => view.backend = Some(child),
             Err(e) => view.push_line(format!("⚠ 백엔드 실행 실패: {e} (RECORDER_PYTHON 확인)"), true),
         }
 

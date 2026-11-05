@@ -174,3 +174,33 @@ python live_transcribe.py
 - [ ] Windows 1: 실행, GPU 유무와 지연 시간 기록
 - [ ] 나머지 PC: 같은 순서로 확인
 - [ ] txt 파일 저장 확인
+
+---
+
+## GPUI 앱 + Python 백엔드 (sangyun 브랜치)
+
+```
+[app/ Rust·GPUI 화면]  ──실행──▶  [backend.py Python]
+        ▲                          - 마이크·시스템 소리 녹음, Qwen3-ASR 전사 (live_transcribe.py 재사용)
+        └──── stdout JSON 한 줄씩 ──┘
+```
+
+### 백엔드 ↔ 앱 약속 (백엔드 팀과 맞출 부분)
+- 앱이 `python -X utf8 backend.py [옵션]`을 실행한다. 앱 실행 옵션은 그대로 백엔드에 넘어간다.
+- 백엔드는 stdout에 UTF-8 JSON을 한 줄씩 쓴다. 로그는 stderr로만 쓴다.
+  - `{"type": "status", "msg": "…"}` 상태
+  - `{"type": "text", "text": "[14:31:05] 전사된 문장"}` 전사 결과
+  - `{"type": "error", "msg": "…"}` 오류
+- 앱 창을 닫으면 앱이 백엔드 프로세스를 끈다.
+- 주의(Windows): 백엔드에서 stdin을 읽으며 기다리면 torch import가 멈춘다. stdin은 쓰지 않는다.
+
+### 실행 (Windows)
+1. Visual Studio Build Tools(C++를 사용한 데스크톱 개발)와 Rust(rustup) 설치
+2. torch·qwen-asr·soundcard가 설치된 Python을 지정하고 실행:
+   ```powershell
+   $env:RECORDER_PYTHON = "C:\경로\.venv\Scripts\python.exe"
+   cd app
+   cargo run -- --model C:\경로\qwen3_asr_1.7b_ko --source both
+   ```
+   - `--source mic|system|both`, `--chunk 4`, `--out 경로.txt` 등은 `live_transcribe.py`와 같다.
+   - 첫 빌드는 4분쯤 걸린다.
