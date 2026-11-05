@@ -174,3 +174,50 @@ python live_transcribe.py
 - [ ] Windows 1: 실행, GPU 유무와 지연 시간 기록
 - [ ] 나머지 PC: 같은 순서로 확인
 - [ ] txt 파일 저장 확인
+
+---
+
+## GPUI 앱 + Python 백엔드 (sangyun 브랜치)
+
+```
+[app/ Rust·GPUI 화면]  ──실행──▶  [backend.py Python]
+        ▲                          - 마이크·시스템 소리 녹음, Qwen3-ASR 전사 (live_transcribe.py 재사용)
+        └──── stdout JSON 한 줄씩 ──┘
+```
+
+### 백엔드 ↔ 앱 약속 (백엔드 팀과 맞출 부분)
+- 앱이 `python -X utf8 backend.py [옵션]`을 실행한다. 앱 실행 옵션은 그대로 백엔드에 넘어간다.
+- 백엔드는 stdout에 UTF-8 JSON을 한 줄씩 쓴다. 로그는 stderr로만 쓴다.
+  - `{"type": "status", "msg": "…"}` 상태
+  - `{"type": "text", "text": "[14:31:05] 전사된 문장"}` 전사 결과
+  - `{"type": "error", "msg": "…"}` 오류
+- `text` 줄에는 `clock`(표시용 시각), `start`/`end`(녹음 시각, Unix 초), `infer_sec`(전사 시간)도 들어간다.
+  앱은 `start`/`end`가 TTS 재생 구간과 겹치면 TTS 소리가 다시 잡힌 것으로 보고 버린다.
+- 앱 창을 닫으면 앱이 백엔드 프로세스를 끈다.
+- 주의(Windows): 백엔드에서 stdin을 읽으며 기다리면 torch import가 멈춘다. stdin은 쓰지 않는다.
+
+### 실행 (Windows)
+1. Visual Studio Build Tools(C++를 사용한 데스크톱 개발)와 Rust(rustup) 설치
+2. torch·qwen-asr·soundcard가 설치된 Python을 지정하고 실행:
+   ```powershell
+   $env:RECORDER_PYTHON = "C:\경로\.venv\Scripts\python.exe"
+   cd app
+   cargo run -- --model C:\경로\qwen3_asr_1.7b_ko --source both
+   ```
+   - `--source mic|system|both`, `--chunk 4`, `--out 경로.txt` 등은 `live_transcribe.py`와 같다.
+   - 첫 빌드는 4분쯤 걸린다.
+
+### 전사 방식 (속도·정확도)
+- **VAD 문장 단위**: Silero VAD로 말이 0.6초 끊기면 바로 전사한다. 고정 4초 단위보다 빨리 뜨고 단어 중간에서 안 잘린다.
+  15초 넘게 이어지면 마지막 3초 중 가장 조용한 곳에서 자른다.
+- 말 시작 전 0.3초를 같이 넣는다. 이 모델은 앞에 무음이 0.5초 이상 붙으면 첫 단어를 빼먹는다(시험 결과).
+- 언어는 한국어로 고정한다. 앞 문장은 문맥으로 넘기지 않는다(시험해 보니 더 틀림).
+  수업 용어는 `--context "GPUI, 러스트, 백엔드"`로 넘기면 도움이 된다.
+- Windows에서는 백엔드의 효율 모드(EcoQoS)를 끈다. 창 없는 프로세스라 CPU가 느려져 전사가 2배 느렸다.
+- 조절 옵션: `--pause 0.6`(문장 끝으로 볼 무음 초), `--max-seg 15`, `--vad 0.5`
+- 테스트: `--input-wav a.wav b.wav`로 녹음 대신 파일을 실시간 속도로 넣을 수 있다.
+
+### TTS (전사 결과 읽기)
+- Windows 기본 음성(SAPI)을 쓴다. 한국어 음성(Microsoft Heami)이 있으면 자동으로 고른다. 오프라인, 추가 설치 없음.
+- 문장을 누르면 읽는다. "자동 읽기"를 켜면 새 문장마다 읽는다. "읽기 멈춤"으로 끊는다.
+- 시스템 소리를 전사 중이면 TTS 소리도 녹음된다. 읽는 동안 들어온 소리는 버리므로, 그동안 나온 수업 내용은 빠질 수 있다.

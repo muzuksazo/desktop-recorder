@@ -19,6 +19,9 @@
 //! 5. **100% Vector SVG Icons (`MemoryAssetSource`)**:
 //!    - Replaced all emojis with crisp embedded SVG icons rendered via GPUI's `svg()`.
 
+#[allow(dead_code)]
+mod tts;
+
 use std::{
     borrow::Cow,
     collections::VecDeque,
@@ -611,13 +614,31 @@ fn glass_pill_shadows() -> Vec<BoxShadow> {
 
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[allow(dead_code)]
 enum BackendMsg {
-    Status { msg: String },
-    Partial { text: String },
-    Text { text: String },
-    Error { msg: String },
-    Level { rms: f32 },
-    Telemetry { rms: f32, mem_mb: f32 },
+    Status {
+        msg: String,
+    },
+    Partial {
+        text: String,
+    },
+    Text {
+        text: String,
+        clock: Option<String>,
+        start: Option<f64>,
+        end: Option<f64>,
+        infer_sec: Option<f64>,
+    },
+    Error {
+        msg: String,
+    },
+    Level {
+        rms: f32,
+    },
+    Telemetry {
+        rms: f32,
+        mem_mb: f32,
+    },
 }
 
 enum Event {
@@ -710,6 +731,15 @@ struct TranscriptView {
     items: VecDeque<TranscriptItem>,
     scroll: ScrollHandle,
     _backend: Option<Child>,
+}
+
+impl Drop for TranscriptView {
+    fn drop(&mut self) {
+        if let Some(mut child) = self._backend.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl TranscriptView {
@@ -819,9 +849,22 @@ impl TranscriptView {
                     self.scroll.scroll_to_bottom();
                 }
             }
-            Event::Msg(BackendMsg::Text { text }) => {
+            Event::Msg(BackendMsg::Text {
+                text,
+                clock,
+                ..
+            }) => {
                 self.partial = "".into();
-                self.push_line(text, false);
+                let formatted = if let Some(c) = clock {
+                    if text.starts_with('[') {
+                        text
+                    } else {
+                        format!("[{c}] {text}")
+                    }
+                } else {
+                    text
+                };
+                self.push_line(formatted, false);
             }
             Event::Msg(BackendMsg::Error { msg }) => self.push_line(msg, true),
             Event::Msg(BackendMsg::Level { rms }) => {
