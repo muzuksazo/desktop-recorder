@@ -244,7 +244,12 @@ def main():
 
     if args.out is None:
         here = os.path.dirname(os.path.abspath(__file__))
-        args.out = os.path.join(here, dt.datetime.now().strftime("transcript_%Y-%m-%d_%H%M.txt"))
+        if ".app/Contents/Resources" in here or not os.access(here, os.W_OK):
+            out_dir = os.path.expanduser("~/Documents/Talkit")
+            os.makedirs(out_dir, exist_ok=True)
+        else:
+            out_dir = here
+        args.out = os.path.join(out_dir, dt.datetime.now().strftime("transcript_%Y-%m-%d_%H%M.txt"))
 
     # macOS Apple Silicon 기본: MLX 4-bit 1초 단위 실시간 스트리밍 모드
     if platform.system() == "Darwin" and not args.input_wav and not args.use_vad:

@@ -73,6 +73,106 @@ def list_devices():
     print("  ", sc.default_speaker().name)
 
 
+def find_macos_audio_tap_binary():
+    """macOS 내장 ScreenCaptureKit 기반 시스템 오디오 캡처 헬퍼 바이너리 경로를 찾는다."""
+    if platform.system() != "Darwin":
+        return None
+    from pathlib import Path
+    import subprocess
+
+    base_dir = Path(__file__).resolve().parent
+    cache_bin = Path.home() / ".cache" / "talkit" / "macos_audio_tap"
+    candidates = [
+        base_dir / "macos_audio_tap",
+        cache_bin,
+    ]
+    for c in candidates:
+        if c.is_file() and os.access(c, os.X_OK):
+            return str(c)
+
+    swift_src = base_dir / "macos_audio_tap.swift"
+    target_bin = base_dir / "macos_audio_tap" if os.access(base_dir, os.W_OK) else cache_bin
+    if swift_src.is_file():
+        try:
+            target_bin.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["swiftc", "-O", "-parse-as-library", str(swift_src), "-o", str(target_bin)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+            )
+            if target_bin.is_file() and os.access(target_bin, os.X_OK):
+                return str(target_bin)
+        except Exception:
+            pass
+    return None
+
+
+class ScreenCaptureKitRecorder(threading.Thread):
+    """macOS ScreenCaptureKit 헬퍼(macos_audio_tap)로부터 16kHz mono float32 시스템 오디오를 읽는다."""
+
+    def __init__(self, tap_bin, out_q, stop_event, label="시스템"):
+        super().__init__(daemon=True)
+        self.tap_bin = tap_bin
+        self.out_q = out_q
+        self.stop_event = stop_event
+        self.label = label
+        self.name = "macOS ScreenCaptureKit (시스템 오디오)"
+
+    def run(self):
+        import subprocess
+
+        frames = int(SAMPLE_RATE * BLOCK_SEC)
+        bytes_per_block = frames * 4  # float32 = 4 bytes
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                [self.tap_bin],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=bytes_per_block * 2,
+            )
+            while not self.stop_event.is_set():
+                raw = proc.stdout.read(bytes_per_block) if proc.stdout else b""
+                if not raw or len(raw) < bytes_per_block:
+                    if self.stop_event.is_set():
+                        break
+                    err_msg = ""
+                    if proc.stderr:
+                        try:
+                            err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            pass
+                    raise RuntimeError(err_msg or "ScreenCaptureKit 오디오 스트림이 종료되었습니다.")
+
+                block = np.frombuffer(raw, dtype=np.float32).copy()
+                try:
+                    self.out_q.put_nowait(block)
+                except queue.Full:
+                    try:
+                        self.out_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.out_q.put_nowait(block)
+        except Exception as e:
+            if not self.stop_event.is_set():
+                try:
+                    self.out_q.put_nowait(RuntimeError(f"[{self.label}] 녹음 오류: {e}"))
+                except queue.Full:
+                    pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+
 class Recorder(threading.Thread):
     """장치 하나에서 계속 녹음해서 out_q 에 0.5초 블록을 넣는다 (백프레셔 시 오래된 블록 드롭)."""
 
@@ -200,30 +300,43 @@ class Transcriber(threading.Thread):
         self.ui_q.put(("status", f"듣는 중… (engine={dev}, {mode_desc})"))
 
         # 장치 준비
-        sources = []
-        if args.source in ("mic", "both"):
-            sources.append(("마이크", sc.default_microphone()))
-        if args.source in ("system", "both"):
-            sys_dev = find_system_audio_device(args.system_device)
-            if sys_dev is None:
-                self.ui_q.put(
-                    (
-                        "error",
-                        "시스템 소리 장치를 못 찾았습니다. Mac은 BlackHole 설치가 필요합니다 "
-                        "(README 참고). 지금은 마이크만 씁니다.",
-                    )
-                )
-                if not any(lbl == "마이크" for lbl, _ in sources):
-                    sources.append(("마이크", sc.default_microphone()))
-            else:
-                sources.append(("시스템", sys_dev))
-
         queues = []
-        for label, device in sources:
-            q = queue.Queue(maxsize=24)  # 최대 12초치 버퍼만 유지 (무한 메모리 누적 방지)
-            Recorder(device, q, self.stop_event, label).start()
-            queues.append((label, q))
-            self.ui_q.put(("status_add", f"{label}: {device.name}"))
+        if args.source in ("mic", "both"):
+            mic_dev = sc.default_microphone()
+            q = queue.Queue(maxsize=24)
+            Recorder(mic_dev, q, self.stop_event, "마이크").start()
+            queues.append(["마이크", q])
+            self.ui_q.put(("status_add", f"마이크: {mic_dev.name}"))
+
+        if args.source in ("system", "both"):
+            sys_dev = find_system_audio_device(args.system_device) if args.system_device else None
+            tap_bin = find_macos_audio_tap_binary() if sys_dev is None else None
+            if tap_bin is not None:
+                q = queue.Queue(maxsize=24)
+                ScreenCaptureKitRecorder(tap_bin, q, self.stop_event, "시스템").start()
+                queues.append(["시스템", q])
+                self.ui_q.put(("status_add", "시스템: ScreenCaptureKit (내장 루프백)"))
+            else:
+                if sys_dev is None:
+                    sys_dev = find_system_audio_device(None)
+                if sys_dev is not None:
+                    q = queue.Queue(maxsize=24)
+                    Recorder(sys_dev, q, self.stop_event, "시스템").start()
+                    queues.append(["시스템", q])
+                    self.ui_q.put(("status_add", f"시스템: {sys_dev.name}"))
+                else:
+                    self.ui_q.put(
+                        (
+                            "error",
+                            "시스템 소리 장치를 찾지 못해 마이크로 대체합니다.",
+                        )
+                    )
+                    if not any(lbl == "마이크" for lbl, _ in queues):
+                        mic_dev = sc.default_microphone()
+                        q = queue.Queue(maxsize=24)
+                        Recorder(mic_dev, q, self.stop_event, "마이크").start()
+                        queues.append(["마이크", q])
+                        self.ui_q.put(("status_add", f"마이크: {mic_dev.name}"))
 
         out_path = args.out
 
@@ -234,14 +347,25 @@ class Transcriber(threading.Thread):
 
     def _read_mixed_block(self, queues):
         mixed = None
-        for _, q in queues:
+        dead_indices = []
+        for idx, (label, q) in enumerate(queues):
             item = q.get()
             if isinstance(item, Exception):
                 self.ui_q.put(("error", str(item)))
-                return None
+                dead_indices.append(idx)
+                continue
             mixed = item if mixed is None else mixed + item
+
+        for idx in reversed(dead_indices):
+            queues.pop(idx)
+
+        if mixed is None:
+            return None
+
         if len(queues) > 1:
-            mixed = mixed / len(queues)
+            peak = float(np.max(np.abs(mixed)))
+            if peak > 1.0:
+                mixed = mixed / peak
         return mixed
 
     def _commit_text(self, text: str, out_path: str):
@@ -265,8 +389,9 @@ class Transcriber(threading.Thread):
         import gc
         import mlx.core as mx
 
-        max_utterance_sec = max(4.0, float(args.chunk) * 1.5)
+        max_utterance_sec = max(6.0, float(args.chunk) * 1.5)
         state = None
+        last_nonempty_partial = ""
         silent_blocks = 0
         active_sec = 0.0
         step_counter = 0
@@ -292,20 +417,26 @@ class Transcriber(threading.Thread):
                 if state is None:
                     continue
                 silent_blocks += 1
-                # 발화 중 잠깐 쉬는 호흡(0.5초)은 버퍼에 포함하고, 1.0초(2블록) 연속 무음이면 문장 확정
+                # 발화 중 잠깐 쉬는 호흡(0.5초)은 버퍼에 포함하되, 이미 인식된 텍스트는 절대 지우지 않는다
                 if silent_blocks < 2:
                     engine.streaming_transcribe(block, state)
                     if state.text:
+                        last_nonempty_partial = state.text
                         self.ui_q.put(("partial", state.text))
                     continue
 
                 try:
                     engine.finish_streaming_transcribe(state)
+                    final_text = (state.text or "").strip() or last_nonempty_partial.strip()
                     self.ui_q.put(("partial", ""))
-                    self._commit_text(state.text, out_path)
+                    if final_text:
+                        self._commit_text(final_text, out_path)
                 except Exception as e:
+                    if last_nonempty_partial.strip():
+                        self._commit_text(last_nonempty_partial.strip(), out_path)
                     self.ui_q.put(("error", f"스트리밍 마감 오류: {e}"))
                 state = None
+                last_nonempty_partial = ""
                 silent_blocks = 0
                 active_sec = 0.0
                 mx.clear_cache()
@@ -319,22 +450,26 @@ class Transcriber(threading.Thread):
                 block = block * min(3.0, 0.4 / peak)
 
             if state is None:
+                last_nonempty_partial = ""
                 state = engine.init_streaming_state(
                     language="Korean",
                     chunk_size_sec=1.0,
-                    unfixed_chunk_num=2,
-                    unfixed_token_num=6,
+                    unfixed_chunk_num=1,
+                    unfixed_token_num=2,
                 )
 
             prev_chunk_id = state.chunk_id
             try:
                 engine.streaming_transcribe(block, state)
                 active_sec += BLOCK_SEC
-                if state.chunk_id != prev_chunk_id and state.text:
-                    self.ui_q.put(("partial", state.text))
+                if state.text:
+                    last_nonempty_partial = state.text
+                if state.chunk_id != prev_chunk_id and last_nonempty_partial:
+                    self.ui_q.put(("partial", last_nonempty_partial))
             except Exception as e:
                 self.ui_q.put(("error", f"스트리밍 전사 오류: {e}"))
                 state = None
+                last_nonempty_partial = ""
                 active_sec = 0.0
                 mx.clear_cache()
                 continue
@@ -342,11 +477,16 @@ class Transcriber(threading.Thread):
             if active_sec >= max_utterance_sec:
                 try:
                     engine.finish_streaming_transcribe(state)
+                    final_text = (state.text or "").strip() or last_nonempty_partial.strip()
                     self.ui_q.put(("partial", ""))
-                    self._commit_text(state.text, out_path)
+                    if final_text:
+                        self._commit_text(final_text, out_path)
                 except Exception as e:
+                    if last_nonempty_partial.strip():
+                        self._commit_text(last_nonempty_partial.strip(), out_path)
                     self.ui_q.put(("error", f"스트리밍 구간 확정 오류: {e}"))
                 state = None
+                last_nonempty_partial = ""
                 active_sec = 0.0
                 mx.clear_cache()
                 gc.collect()

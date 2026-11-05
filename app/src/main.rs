@@ -655,6 +655,8 @@ fn resolve_python_bin() -> PathBuf {
         root.join(".venv").join("bin").join("python"),
         root.join(".venv").join("Scripts").join("python.exe"),
         PathBuf::from("/Users/yun-yeowon/qwen3-asr-ko/.venv/bin/python"),
+        PathBuf::from("/Users/yun-yeowon/desktop-recorder/.venv/bin/python"),
+        PathBuf::from("/opt/homebrew/bin/python3"),
         PathBuf::from("python3"),
         PathBuf::from("python"),
     ];
@@ -666,11 +668,26 @@ fn resolve_python_bin() -> PathBuf {
     PathBuf::from("python3")
 }
 
+fn resolve_backend_script() -> PathBuf {
+    if let Some(s) = env::var_os("RECORDER_BACKEND") {
+        return PathBuf::from(s);
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            let bundled = macos_dir.join("..").join("Resources").join("backend.py");
+            if bundled.exists() {
+                return bundled;
+            }
+        }
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("backend.py")
+}
+
 fn spawn_backend(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
     let python = resolve_python_bin();
-    let script = env::var_os("RECORDER_BACKEND")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("backend.py"));
+    let script = resolve_backend_script();
 
     let mut child = Command::new(&python)
         .args(["-X", "utf8"])
@@ -2171,7 +2188,16 @@ impl TranscriptView {
                     )
                     // 4. Inset Live Streaming Subtitle Bar (Talkit Brand Pill)
                     .child({
-                        let partial_for_copy = self.partial.to_string();
+                        let latest_committed_body = self.items.back().map(|it| it.body.clone());
+                        let dock_has_text = has_partial || latest_committed_body.is_some();
+                        let partial_for_copy = if has_partial {
+                            self.partial.to_string()
+                        } else {
+                            latest_committed_body
+                                .as_ref()
+                                .map(|s| s.to_string())
+                                .unwrap_or_default()
+                        };
                         let live_copied = self.copied_index == Some(usize::MAX - 1);
                         div()
                             .id("bottom-live-dock")
@@ -2180,7 +2206,7 @@ impl TranscriptView {
                             .px(px(if is_compact { 12.0 } else { 16.0 }))
                             .py(px(if is_short { 8.0 } else { 12.0 }))
                             .rounded(px(18.0))
-                            .when(has_partial, |d| d.cursor_pointer())
+                            .when(dock_has_text, |d| d.cursor_pointer())
                             .bg(if has_partial {
                                 linear_gradient(
                                     180.0,
@@ -2259,13 +2285,13 @@ impl TranscriptView {
                                                 "TALK IT, GET IT"
                                             }),
                                     )
-                                    // Multi-line wrapping live caption
+                                    // Multi-line wrapping live caption (retains latest committed sentence when idle)
                                     .child(
                                         div()
                                             .flex_1()
                                             .min_w(px(0.0))
                                             .text_size(px(body_font))
-                                            .text_color(rgba(if has_partial {
+                                            .text_color(rgba(if dock_has_text {
                                                 theme.text_primary
                                             } else {
                                                 theme.text_muted
@@ -2274,12 +2300,14 @@ impl TranscriptView {
                                                 "전사가 일시정지되었습니다.".into()
                                             } else if has_partial {
                                                 partial_text
+                                            } else if let Some(last_body) = latest_committed_body {
+                                                last_body
                                             } else {
                                                 "말하는 순간, 바로 텍스트로 — 실시간 스트리밍 대기 중…".into()
                                             }),
                                     ),
                             )
-                            .when(has_partial, |d| {
+                            .when(dock_has_text, |d| {
                                 let txt_down = partial_for_copy.clone();
                                 let txt_drag = partial_for_copy.clone();
                                 let txt_click = partial_for_copy;

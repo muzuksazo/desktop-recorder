@@ -308,25 +308,39 @@ class QuantizedMLXQwen3ASR:
                 state.audio_accum = state.audio_accum[-max_window_samples:]
 
             prefix_tokens = self._clean_prefix_tokens(state)
+            prev_text = state.text
+            prev_tokens = list(state.decoded_tokens)
             state.decoded_tokens = self._decode_step_with_prefix(
                 audio_samples=state.audio_accum,
                 language=state.language,
                 context=state.context,
                 prefix_tokens=prefix_tokens,
             )
-            state.text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
+            new_text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
+            if new_text:
+                state.text = new_text
+            elif prev_text:
+                state.text = prev_text
+                state.decoded_tokens = prev_tokens
             state.chunk_id += 1
 
         return state
 
     def finish_streaming_transcribe(self, state: MLXStreamingState) -> MLXStreamingState:
-        if state.buffer is not None and state.buffer.shape[0] > 0:
+        has_tail = state.buffer is not None and state.buffer.shape[0] > 0
+        if has_tail:
             tail = state.buffer
             state.buffer = np.zeros((0,), dtype=np.float32)
             if state.audio_accum.shape[0] == 0:
                 state.audio_accum = tail
             else:
                 state.audio_accum = np.concatenate([state.audio_accum, tail], axis=0)
+        elif state.text:
+            state.audio_accum = np.zeros((0,), dtype=np.float32)
+            state.buffer = np.zeros((0,), dtype=np.float32)
+            mx.clear_cache()
+            gc.collect()
+            return state
 
         if state.audio_accum.shape[0] == 0:
             return state
@@ -336,6 +350,8 @@ class QuantizedMLXQwen3ASR:
             state.audio_accum = state.audio_accum[-max_window_samples:]
 
         prefix_tokens = self._clean_prefix_tokens(state)
+        prev_text = state.text
+        prev_tokens = list(state.decoded_tokens)
         state.decoded_tokens = self._decode_step_with_prefix(
             audio_samples=state.audio_accum,
             language=state.language,
@@ -343,7 +359,12 @@ class QuantizedMLXQwen3ASR:
             prefix_tokens=prefix_tokens,
             max_new_tokens=96,
         )
-        state.text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
+        new_text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
+        if new_text:
+            state.text = new_text
+        elif prev_text:
+            state.text = prev_text
+            state.decoded_tokens = prev_tokens
         state.chunk_id += 1
         # Release accumulated audio buffers immediately after utterance completion
         state.audio_accum = np.zeros((0,), dtype=np.float32)
