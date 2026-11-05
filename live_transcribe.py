@@ -549,10 +549,15 @@ class Transcriber(threading.Thread):
             self._run_chunk_loop(model, queues, out_path, args)
 
     def _read_channel_blocks(self, queues):
+        if not queues:
+            return None
         blocks = {}
         dead_indices = []
         for idx, (label, q) in enumerate(queues):
-            item = q.get()
+            try:
+                item = q.get(timeout=0.26 if not blocks else 0.04)
+            except queue.Empty:
+                continue
             if isinstance(item, Exception):
                 self.ui_q.put(("error", str(item)))
                 dead_indices.append(idx)
@@ -562,7 +567,7 @@ class Transcriber(threading.Thread):
         for idx in reversed(dead_indices):
             queues.pop(idx)
 
-        if not blocks:
+        if not queues:
             return None
         return blocks
 
@@ -697,6 +702,8 @@ class Transcriber(threading.Thread):
             blocks = self._read_channel_blocks(queues)
             if blocks is None:
                 return
+            if not blocks:
+                continue
 
             if "시스템" in blocks:
                 sys_ref_ring.append(blocks["시스템"].astype(np.float32, copy=True))

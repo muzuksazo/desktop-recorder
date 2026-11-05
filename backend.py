@@ -239,7 +239,7 @@ def main():
     p.add_argument("--out", default=None, help="저장할 txt 경로")
     p.add_argument("--input-wav", nargs="+", default=None,
                    help="테스트용: 녹음 대신 이 wav 들(16kHz mono)을 실시간 속도로 흘려 넣는다")
-    args = p.parse_args()
+    args, _ = p.parse_known_args()
     args.language = args.language or None
 
     if args.out is None:
