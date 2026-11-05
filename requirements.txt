@@ -4,3 +4,5 @@ numpy
 soundfile
 soundcard>=0.4.3
 silero-vad
+qwen3-asr-mlx; sys_platform == 'darwin' and platform_machine == 'arm64'
+mlx; sys_platform == 'darwin' and platform_machine == 'arm64'

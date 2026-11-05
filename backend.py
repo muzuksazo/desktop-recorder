@@ -2,24 +2,16 @@
 전사 백엔드 (화면 없음) — GPUI 앱(app/)이 실행하고, stdout 을 한 줄씩 읽어 화면에 표시한다.
 
 동작
-- 마이크·시스템 소리를 녹음해 섞는다 (live_transcribe.py 의 녹음 코드 재사용).
-- VAD(Silero)로 말이 끊기는 지점을 찾아 문장 단위로 자른다. 말이 끝나면 바로 전사하므로
-  고정 4초 단위보다 빨리 뜨고, 단어 중간에서 잘리지 않는다. 너무 길면 --max-seg 초에서 자른다.
-- 전사는 한국어로 고정하고, --context 용어(수업에 자주 나오는 단어)를 문맥으로 넘긴다.
-- Windows 에서는 효율 모드(EcoQoS)를 끄고 우선순위를 올린다 (창 없는 프로세스라 느려지는 것 방지).
+- macOS (Apple Silicon): MLX 4-bit (yeowon/qwen3_asr_1.7b_ko-MLX-4bit) 실시간 1초 단위 스트리밍 전사 (live_transcribe.py 재사용).
+- Windows / --use-vad: VAD(Silero)로 말이 끊기는 지점을 찾아 문장 단위로 전사하며, Windows 에서는 효율 모드(EcoQoS)를 끈다.
 
 stdout 약속 (앱 ↔ 백엔드, UTF-8, 한 줄에 JSON 하나)
-    {"type": "status", "msg": "…"}
-    {"type": "text", "text": "전사된 문장", "clock": "14:31:05",
+    {"type": "status",  "msg": "…"}
+    {"type": "partial", "text": "실시간 스트리밍 인식 중…"}
+    {"type": "text",    "text": "전사된 문장", "clock": "14:31:05",
      "start": 1730790665.2, "end": 1730790668.9, "infer_sec": 0.84}
-        start/end: 그 소리가 녹음된 시각 (Unix 초). 앱이 TTS 재생 중 들어온 소리를 거를 때 쓴다.
-    {"type": "error", "msg": "…"}
-로그·경고는 stderr 로만 나간다. stdin 은 쓰지 않는다
-(Windows 에서 stdin 을 읽으며 기다리면 torch import 가 멈춘다).
-종료: 앱이 끝날 때 이 프로세스를 끈다. 앱이 먼저 사라지면 다음 줄을 쓸 때(BrokenPipe) 끝난다.
-
-직접 확인할 때
-    python backend.py --model C:\\경로\\qwen3_asr_1.7b_ko --source mic
+    {"type": "error",   "msg": "…"}
+로그·경고는 stderr 로만 나간다.
 """
 
 import argparse
@@ -94,8 +86,6 @@ class Segmenter(threading.Thread):
         vad = load_silero_vad(onnx=False)
         a = self.args
         fdur = VAD_FRAME / SAMPLE_RATE
-        # 말 시작 전 0.3초를 넣는다. 시험 결과: 0.1~0.2초는 첫 단어가 뭉개지고("경쟁률"→"경진"),
-        # 0.5초 이상 무음이 앞에 붙으면 모델이 첫 단어("근데")를 아예 빼먹는다.
         pre_frames = int(0.3 / fdur)
         end_frames = max(1, int(a.pause / fdur))     # 이만큼 조용하면 문장 끝
         max_frames = int(a.max_seg / fdur)
@@ -117,7 +107,6 @@ class Segmenter(threading.Thread):
                 self.seg_q.put((np.concatenate(frames), start, start + len(frames) * fdur))
 
         while not self.stop.is_set():
-            # 장치마다 한 블록씩 받아서 섞는다
             mixed = None
             for label, q in self.queues:
                 item = q.get()
@@ -132,7 +121,6 @@ class Segmenter(threading.Thread):
             buf = np.concatenate([leftover, mixed])
             n = len(buf) // VAD_FRAME
             leftover = buf[n * VAD_FRAME:]
-            # 이 블록 첫 프레임의 녹음 시각 (블록 끝 = 지금)
             t0 = now - len(buf) / SAMPLE_RATE
 
             for i in range(n):
@@ -158,12 +146,10 @@ class Segmenter(threading.Thread):
                 silent = 0 if speech else silent + 1
 
                 if silent >= end_frames:
-                    # 말이 끝남: 끝의 무음은 0.3초만 남긴다
                     keep = len(seg) - silent + int(0.3 / fdur)
                     emit_seg(seg[:keep], probs[:keep], seg_start)
                     seg, probs, silent = [], [], 0
                 elif len(seg) >= max_frames:
-                    # 너무 김: 마지막 3초 중 VAD 확률이 가장 낮은 곳(숨 쉬는 틈)에서 자르고 나머지는 이어 간다
                     lo = max(min_frames, len(seg) - search_frames)
                     cut = min(range(lo, len(seg)), key=lambda j: probs[j])
                     emit_seg(seg[:cut], probs[:cut], seg_start)
@@ -198,8 +184,6 @@ def feed_wavs(paths, q, stop, block_sec=0.2):
 
 # ---------------------------------------------------------------- 전사
 def transcribe_loop(args, model, seg_q, emit, stop, out_path):
-    # 앞 문장은 문맥으로 넘기지 않는다: 시험해 보니 오히려 틀렸다 ("테즈메이니아" → "테즈메인 이하").
-    # 용어(--context)는 도움이 됐다 ("상간 지방" → "산간 지방").
     context = args.context.strip()
     while not stop.is_set() and not emit.broken.is_set():
         try:
@@ -207,7 +191,6 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
         except queue.Empty:
             continue
 
-        # 밀려 있으면 상태로 알린다 (처리 속도 < 말 속도)
         backlog = seg_q.qsize()
         if backlog >= 3:
             emit(type="status", msg=f"전사가 밀리고 있어요: 대기 {backlog}개")
@@ -243,23 +226,62 @@ def main():
     p = argparse.ArgumentParser(description="전사 백엔드 (GPUI 앱용, 화면 없음)")
     p.add_argument("--model", default=lt.MODEL_ID, help="모델 폴더 경로 또는 HF 모델 ID")
     p.add_argument("--source", choices=["both", "mic", "system"], default="both")
-    p.add_argument("--device", default="auto", help="auto / cuda:0 / cpu")
+    p.add_argument("--chunk", type=float, default=6.0, help="최대 발화 구간 길이(초, 기본 6)")
+    p.add_argument("--device", default="auto", help="auto / mlx / cuda:0 / mps / cpu")
     p.add_argument("--system-device", default=None, help="시스템 소리 장치 이름(일부만 써도 됨)")
+    p.add_argument("--silence", type=float, default=0.005, help="이 값보다 조용하면 건너뜀")
     p.add_argument("--language", default="Korean", help="전사 언어 고정 (빈 값이면 자동 감지)")
     p.add_argument("--context", default="", help="자주 나오는 용어 (예: \"GPUI, 러스트, 백엔드\")")
     p.add_argument("--vad", type=float, default=0.5, help="말로 볼 VAD 확률 (0~1, 기본 0.5)")
     p.add_argument("--pause", type=float, default=0.6, help="이만큼(초) 조용하면 문장 끝 (기본 0.6)")
     p.add_argument("--max-seg", type=float, default=15.0, help="한 번에 전사할 최대 길이(초, 기본 15)")
+    p.add_argument("--use-vad", action="store_true", help="Silero VAD 문장 단위 모드 강제 사용")
     p.add_argument("--out", default=None, help="저장할 txt 경로")
     p.add_argument("--input-wav", nargs="+", default=None,
                    help="테스트용: 녹음 대신 이 wav 들(16kHz mono)을 실시간 속도로 흘려 넣는다")
-    p.add_argument("--chunk", type=float, default=None, help=argparse.SUPPRESS)  # 예전 옵션 (무시)
     args = p.parse_args()
     args.language = args.language or None
 
     if args.out is None:
         here = os.path.dirname(os.path.abspath(__file__))
         args.out = os.path.join(here, dt.datetime.now().strftime("transcript_%Y-%m-%d_%H%M.txt"))
+
+    # macOS Apple Silicon 기본: MLX 4-bit 1초 단위 실시간 스트리밍 모드
+    if platform.system() == "Darwin" and not args.input_wav and not args.use_vad:
+        ui_q = queue.Queue()
+        stop = threading.Event()
+        emit(type="status", msg=f"모델 로딩 중… ({args.model})")
+        emit(type="status", msg=f"저장 파일: {args.out}")
+        worker = lt.Transcriber(args, ui_q, stop)
+        worker.start()
+
+        kinds = {
+            "text": "text",
+            "partial": "partial",
+            "status": "status",
+            "status_add": "status",
+            "error": "error",
+            "level": "level",
+            "telemetry": "telemetry",
+        }
+        while not stop.is_set() and not emit.broken.is_set():
+            try:
+                kind, msg = ui_q.get(timeout=0.2)
+            except queue.Empty:
+                if not worker.is_alive():
+                    return 1
+                continue
+            kind = kinds.get(kind, "status")
+            if kind in ("text", "partial"):
+                emit(type=kind, text=msg)
+            elif kind == "level":
+                emit(type="level", rms=float(msg))
+            elif kind == "telemetry":
+                rms_val, mem_mb = msg
+                emit(type="telemetry", rms=float(rms_val), mem_mb=float(mem_mb))
+            else:
+                emit(type=kind, msg=msg)
+        return 0
 
     emit(type="status", msg=f"모델 로딩 중… ({args.model})")
     try:
