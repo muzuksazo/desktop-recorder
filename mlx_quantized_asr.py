@@ -31,7 +31,7 @@ DEFAULT_MLX_4BIT_MODEL = "yeowon/qwen3_asr_1.7b_ko-MLX-4bit"
 # Cap MLX Metal buffer pool cache to 128 MB so long-running streaming never balloons Unified Memory
 MLX_CACHE_LIMIT_BYTES = 128 * 1024 * 1024
 # Maximum rolling audio window (seconds) fed to the encoder per streaming utterance
-MAX_STREAMING_AUDIO_WINDOW_SEC = 8.0
+MAX_STREAMING_AUDIO_WINDOW_SEC = 24.0
 
 
 class QuantizableTextDecoder(TextDecoder):
@@ -201,8 +201,8 @@ class QuantizedMLXQwen3ASR:
         language: str = "Korean",
         context: str = "",
         chunk_size_sec: float = 1.0,
-        unfixed_chunk_num: int = 2,
-        unfixed_token_num: int = 6,
+        unfixed_chunk_num: int = 4,
+        unfixed_token_num: int = 12,
     ) -> MLXStreamingState:
         chunk_size_samples = max(1, int(round(chunk_size_sec * 16000)))
         return MLXStreamingState(
@@ -257,6 +257,17 @@ class QuantizedMLXQwen3ASR:
                 if next_token in EOS_TOKEN_IDS:
                     break
                 new_tokens.append(next_token)
+                loop_cut = 0
+                n_gen = len(new_tokens)
+                for k_len in range(1, 7):
+                    if n_gen >= 6 * k_len:
+                        pat = new_tokens[-k_len:]
+                        if all(new_tokens[-r * k_len : -(r - 1) * k_len] == pat for r in range(2, 7)):
+                            loop_cut = 5 * k_len
+                            break
+                if loop_cut > 0:
+                    new_tokens = new_tokens[:-loop_cut]
+                    break
                 token_embed = self.decoder.embed_tokens(mx.array([[next_token]]))
                 logits = self.decoder(token_embed, cache=cache, is_embeds=True)
                 mx.eval(logits)
@@ -265,7 +276,7 @@ class QuantizedMLXQwen3ASR:
                 next_token = sample(
                     logits[:, -1, :],
                     temperature=0.0,
-                    repetition_penalty=1.1,
+                    repetition_penalty=1.15,
                     recent_tokens=recent,
                 )
 
@@ -287,6 +298,26 @@ class QuantizedMLXQwen3ASR:
                 return candidate
             k += 1
 
+    @staticmethod
+    def _prepare_eval_audio(audio_accum: np.ndarray, pad_sec: float = 0.0) -> np.ndarray:
+        x = np.asarray(audio_accum, dtype=np.float32)
+        if x.size == 0:
+            return x
+        peak = float(np.max(np.abs(x)))
+        if 0.001 < peak < 0.45:
+            x = x * min(8.0, 0.45 / peak)
+        elif peak > 1.0:
+            x = x / peak
+        x = np.clip(x, -1.0, 1.0)
+        min_samples = 8000  # MIN_ASR_INPUT_SECONDS = 0.5s
+        if x.shape[0] < min_samples:
+            x = np.pad(x, (0, min_samples - x.shape[0]), mode="constant", constant_values=0.0).astype(np.float32)
+        elif pad_sec > 0.0:
+            pad_samples = int(round(pad_sec * 16000))
+            if pad_samples > 0:
+                x = np.concatenate([x, np.zeros((pad_samples,), dtype=np.float32)], axis=0)
+        return x
+
     def streaming_transcribe(self, pcm16k: np.ndarray, state: MLXStreamingState) -> MLXStreamingState:
         x = np.asarray(pcm16k, dtype=np.float32).reshape(-1)
         if x.shape[0] > 0:
@@ -303,19 +334,27 @@ class QuantizedMLXQwen3ASR:
             else:
                 state.audio_accum = np.concatenate([state.audio_accum, chunk], axis=0)
 
-            # Cap rolling audio buffer so encoder sequence length never grows unboundedly
             if state.audio_accum.shape[0] > max_window_samples:
                 state.audio_accum = state.audio_accum[-max_window_samples:]
 
-            prefix_tokens = self._clean_prefix_tokens(state)
+            if float(np.sqrt(np.mean(state.audio_accum**2))) < 0.0008:
+                continue
+
             prev_text = state.text
             prev_tokens = list(state.decoded_tokens)
+
+            # Official qwen_asr prefix rollback
+            use_prefix = self._clean_prefix_tokens(state)
+
+            eval_audio = self._prepare_eval_audio(state.audio_accum, pad_sec=0.0)
             state.decoded_tokens = self._decode_step_with_prefix(
-                audio_samples=state.audio_accum,
+                audio_samples=eval_audio,
                 language=state.language,
                 context=state.context,
-                prefix_tokens=prefix_tokens,
+                prefix_tokens=use_prefix,
+                max_new_tokens=96,
             )
+            setattr(state, "_last_decoded_samples", int(state.audio_accum.shape[0]))
             new_text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
             if new_text:
                 state.text = new_text
@@ -327,6 +366,9 @@ class QuantizedMLXQwen3ASR:
         return state
 
     def finish_streaming_transcribe(self, state: MLXStreamingState) -> MLXStreamingState:
+        valley_truncated = getattr(state, "_valley_truncated", False)
+        prev_best = "" if valley_truncated else (state.text or "")
+        last_decoded_samples = getattr(state, "_last_decoded_samples", 0)
         has_tail = state.buffer is not None and state.buffer.shape[0] > 0
         if has_tail:
             tail = state.buffer
@@ -335,40 +377,43 @@ class QuantizedMLXQwen3ASR:
                 state.audio_accum = tail
             else:
                 state.audio_accum = np.concatenate([state.audio_accum, tail], axis=0)
-        elif state.text:
+
+        needs_final_decode = (
+            valley_truncated
+            or (state.audio_accum.shape[0] != last_decoded_samples)
+            or (not prev_best)
+        )
+        if state.audio_accum.shape[0] < 3200 or not needs_final_decode:
+            if prev_best and not state.text:
+                state.text = prev_best
             state.audio_accum = np.zeros((0,), dtype=np.float32)
             state.buffer = np.zeros((0,), dtype=np.float32)
+            setattr(state, "_valley_truncated", False)
             mx.clear_cache()
             gc.collect()
-            return state
-
-        if state.audio_accum.shape[0] == 0:
             return state
 
         max_window_samples = int(MAX_STREAMING_AUDIO_WINDOW_SEC * 16000)
         if state.audio_accum.shape[0] > max_window_samples:
             state.audio_accum = state.audio_accum[-max_window_samples:]
 
-        prefix_tokens = self._clean_prefix_tokens(state)
-        prev_text = state.text
-        prev_tokens = list(state.decoded_tokens)
+        eval_audio = self._prepare_eval_audio(state.audio_accum, pad_sec=0.0)
         state.decoded_tokens = self._decode_step_with_prefix(
-            audio_samples=state.audio_accum,
+            audio_samples=eval_audio,
             language=state.language,
             context=state.context,
-            prefix_tokens=prefix_tokens,
-            max_new_tokens=96,
+            prefix_tokens=[],
+            max_new_tokens=224,
         )
         new_text = self.tokenizer.decode(state.decoded_tokens, skip_special_tokens=True).strip()
         if new_text:
             state.text = new_text
-        elif prev_text:
-            state.text = prev_text
-            state.decoded_tokens = prev_tokens
+        elif prev_best:
+            state.text = prev_best
         state.chunk_id += 1
-        # Release accumulated audio buffers immediately after utterance completion
         state.audio_accum = np.zeros((0,), dtype=np.float32)
         state.buffer = np.zeros((0,), dtype=np.float32)
+        setattr(state, "_valley_truncated", False)
         mx.clear_cache()
         gc.collect()
         return state

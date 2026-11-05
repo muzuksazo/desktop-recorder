@@ -33,7 +33,210 @@ PYTORCH_MODEL_ID = "TeamUNIVA/qwen3_asr_1.7b_ko"
 MODEL_ID = MLX_MODEL_ID if (platform.system() == "Darwin" and platform.machine() == "arm64") else PYTORCH_MODEL_ID
 
 SAMPLE_RATE = 16000
-BLOCK_SEC = 0.5  # 녹음 스레드가 한 번에 읽는 길이
+BLOCK_SEC = 0.25  # 250ms 고해상도 블록 (어두 자음 보존 및 호흡 골짜기 정밀 감지)
+
+DEFAULT_KO_DOMAIN_CONTEXT = (
+    "한국어 실시간 음성 전사. GitHub, Claude, HuggingFace, OpenAI, Three.js, WebGL, "
+    "GPUI, Rust, Python, MLX, 프론트엔드, 백엔드, 라이선스, 레퍼런스, UI, PiP, TTS, ASR"
+)
+
+
+def _speech_band_rms(samples: np.ndarray, sr: int = SAMPLE_RATE) -> float:
+    """
+    인간 음성 기본주파수 및 한국어 치찰음/마찰음(ㅅ, ㅆ, ㅈ, ㅊ, ㅎ) 대역(150Hz ~ 7,500Hz) 에너지를 추출한다.
+    극저주파 험(<120Hz)만 배제하고 어말 자음/마찰음까지 온전히 감지해 단어 중간 끊김을 방지한다.
+    """
+    if samples is None or samples.size == 0:
+        return 0.0
+    spec = np.fft.rfft(samples)
+    freqs = np.fft.rfftfreq(samples.size, d=1.0 / sr)
+    mask = (freqs >= 150.0) & (freqs <= 7500.0)
+    if not np.any(mask):
+        return float(np.sqrt(np.mean(samples**2)))
+    band_power = np.sum(np.abs(spec[mask]) ** 2) * 2.0 / (samples.size**2)
+    return float(np.sqrt(max(0.0, band_power)))
+
+
+def _find_valley_split_sample(
+    audio_accum: np.ndarray,
+    min_sec: float = 5.5,
+    max_sec: float = 10.5,
+    sr: int = SAMPLE_RATE,
+) -> int:
+    """
+    Official `qwen_asr.inference.utils.split_audio_into_chunks` exact boundary finder:
+    Finds the 100ms window with minimum L1 energy in [min_sec, max_sec] via `np.convolve`
+    and snaps to the exact minimum-amplitude sample inside that window (zero-crossing snap).
+    """
+    total = int(audio_accum.shape[0])
+    left = max(int(min_sec * sr), int(total * 0.50))
+    right = min(int(max_sec * sr), total - int(0.30 * sr))
+    win = max(4, int(0.10 * sr))  # 100ms window
+    if right - left <= win:
+        return total
+
+    seg = audio_accum[left:right]
+    seg_abs = np.abs(seg)
+    window_sums = np.convolve(seg_abs, np.ones(win, dtype=np.float32), mode="valid")
+    min_pos = int(np.argmin(window_sums))
+    local = seg_abs[min_pos : min_pos + win]
+    inner = int(np.argmin(local))
+    boundary = left + min_pos + inner
+    return int(max(left + 1, min(boundary, total)))
+
+
+def _stitch_overlap_text(prev_text: str, new_text: str) -> str:
+    """
+    Removes duplicate boundary words or partial-syllable overlaps when consecutive segments
+    share an overlapping suffix/prefix (e.g. "하고" + "하고 GEO", "목표로" + "표를 했다면").
+    """
+    prev_text = (prev_text or "").strip()
+    new_text = (new_text or "").strip()
+    if not prev_text or not new_text:
+        return new_text
+
+    prev_words = prev_text.split()
+    new_words = new_text.split()
+    max_k = min(len(prev_words), len(new_words), 10)
+    for k in range(max_k, 0, -1):
+        p_tail = "".join(prev_words[-k:]).rstrip(".?!,~")
+        n_head = "".join(new_words[:k]).rstrip(".?!,~")
+        min_len = 2 if k == 1 else 3
+        if len(p_tail) >= min_len and p_tail == n_head:
+            return " ".join(new_words[k:]).strip()
+
+    # Partial word suffix overlap (e.g. prev ends with "목표로", new starts with "표를")
+    p_last = prev_words[-1].rstrip(".?!,~")
+    n_first = new_words[0].rstrip(".?!,~")
+    if len(p_last) >= 3 and len(n_first) >= 2 and p_last != n_first and p_last.endswith(n_first):
+        return " ".join(new_words[1:]).strip()
+
+    return new_text
+
+
+def _suppress_speaker_echo_from_mic(
+    mic_block: np.ndarray, sys_history: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """
+    ScreenCaptureKit 디지털 시스템 원음(sys_history)을 레퍼런스로 사용하는
+    3단계 음향 에코 제거기(Reference-Based Acoustic Echo Cancellation, AEC):
+    1) FFT 교차상관(Cross-Correlation) 및 10ms 에너지 포락선(Envelope) 정렬로 스피커-마이크 지연(Delay) 추정
+    2) 주파수 영역(STFT) 적응형 위너 스펙트럼 감산(Wiener Spectral Echo Subtraction)으로 스피커 잔향 제거
+    3) 파형 상관계수 및 포락선 일관성 점수(echo_coherence)를 반환해 더블토크(사용자 실제 발화) 여부 판별
+    """
+    n = mic_block.shape[0]
+    m = sys_history.shape[0]
+    if n < 320 or m < n:
+        return mic_block, 0.0
+
+    sys_rms = float(np.sqrt(np.mean(sys_history**2)))
+    mic_rms = float(np.sqrt(np.mean(mic_block**2)))
+    if sys_rms < 0.0025 or mic_rms < 0.0005:
+        return mic_block, 0.0
+
+    # 1. FFT 교차상관으로 최적 지연 오프셋 탐색
+    fft_len = 1 << int(np.ceil(np.log2(m + n)))
+    X = np.fft.rfft(sys_history, n=fft_len)
+    Y = np.fft.rfft(mic_block, n=fft_len)
+    corr = np.fft.irfft(X * np.conj(Y), n=fft_len)
+    valid_len = m - n + 1
+    valid_corr = corr[:valid_len]
+    best_offset = int(np.argmax(np.abs(valid_corr)))
+    sys_aligned = sys_history[best_offset : best_offset + n]
+
+    sys_al_norm = float(np.linalg.norm(sys_aligned))
+    mic_norm = float(np.linalg.norm(mic_block))
+    if sys_al_norm < 1e-6 or mic_norm < 1e-6:
+        return mic_block, 0.0
+
+    dot_val = float(np.dot(mic_block, sys_aligned))
+    rho_wave = abs(dot_val) / (mic_norm * sys_al_norm + 1e-8)
+
+    # 10ms(160샘플) 서브프레임 포락선(Envelope) 상관계수 계산 (스피커 위상 왜곡/방 잔향에도 강인함)
+    hop = 160
+    n_frames = n // hop
+    if n_frames >= 4:
+        mic_env = np.sqrt(
+            np.mean(mic_block[: n_frames * hop].reshape(n_frames, hop) ** 2, axis=1)
+        )
+        sys_env = np.sqrt(
+            np.mean(sys_aligned[: n_frames * hop].reshape(n_frames, hop) ** 2, axis=1)
+        )
+        m_centered = mic_env - np.mean(mic_env)
+        s_centered = sys_env - np.mean(sys_env)
+        denom = float(np.linalg.norm(m_centered) * np.linalg.norm(s_centered))
+        rho_env = float(np.dot(m_centered, s_centered) / (denom + 1e-8)) if denom > 1e-7 else 0.0
+    else:
+        rho_env = 0.0
+
+    echo_coherence = max(rho_wave, max(0.0, rho_env))
+
+    # 2. 시간 영역 최소제곱 선형 에코 감산 + 주파수 영역(STFT) 스펙트럼 에코 억제
+    alpha = dot_val / (sys_al_norm * sys_al_norm + 1e-8)
+    td_cleaned = mic_block - np.clip(alpha, -1.5, 1.5) * sys_aligned
+
+    win_len = 320
+    stft_hop = 160
+    if n >= win_len:
+        from numpy.lib.stride_tricks import sliding_window_view
+
+        win = np.hanning(win_len).astype(np.float32)
+        mic_frames = sliding_window_view(td_cleaned, win_len)[::stft_hop] * win
+        sys_frames = sliding_window_view(sys_aligned, win_len)[::stft_hop] * win
+        M_spec = np.fft.rfft(mic_frames, axis=-1)
+        S_spec = np.fft.rfft(sys_frames, axis=-1)
+        M_mag = np.abs(M_spec)
+        S_mag = np.abs(S_spec)
+
+        # 주파수 빈별 평균 에코 전달비 H(f) 추정 후 과감산(Over-subtraction factor = 1.45)
+        H_f = np.sum(M_mag * S_mag, axis=0, keepdims=True) / (
+            np.sum(S_mag * S_mag, axis=0, keepdims=True) + 1e-8
+        )
+        gain = np.clip(1.0 - 1.45 * (H_f * S_mag) / (M_mag + 1e-8), 0.04, 1.0)
+        cleaned_frames = np.fft.irfft(M_spec * gain, n=win_len, axis=-1).astype(np.float32)
+
+        out = np.zeros((n,), dtype=np.float32)
+        w_sum = np.zeros((n,), dtype=np.float32)
+        for idx_f in range(cleaned_frames.shape[0]):
+            start = idx_f * stft_hop
+            out[start : start + win_len] += cleaned_frames[idx_f] * win
+            w_sum[start : start + win_len] += win * win
+        mask = w_sum > 1e-5
+        out[mask] /= w_sum[mask]
+        tail_start = (cleaned_frames.shape[0] - 1) * stft_hop + win_len
+        if tail_start < n:
+            out[tail_start:] = td_cleaned[tail_start:]
+        return out, echo_coherence
+
+    return td_cleaned.astype(np.float32), echo_coherence
+
+
+def _normalize_ko_for_echo(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isalnum())
+
+
+def _is_text_echo_of_system(mic_text: str, sys_texts: list[str]) -> bool:
+    """
+    마이크 채널에서 전사된 텍스트가 시스템 오디오에서 방금 출력된 문장(또는 진행 중인 문장)의
+    스피커 역유입(Bleed) 복사본인지 2-gram 및 부분문자열 유사도로 판별한다.
+    """
+    m_norm = _normalize_ko_for_echo(mic_text)
+    if not m_norm:
+        return False
+    for st in sys_texts:
+        s_norm = _normalize_ko_for_echo(st)
+        if not s_norm:
+            continue
+        if m_norm in s_norm or (len(s_norm) >= 4 and s_norm in m_norm):
+            return True
+        if len(m_norm) >= 3 and len(s_norm) >= 3:
+            m_bigrams = {m_norm[i : i + 2] for i in range(len(m_norm) - 1)}
+            s_bigrams = {s_norm[i : i + 2] for i in range(len(s_norm) - 1)}
+            if m_bigrams:
+                overlap = len(m_bigrams & s_bigrams) / float(len(m_bigrams))
+                if overlap >= 0.35:
+                    return True
+    return False
 
 
 def _has_mlx() -> bool:
@@ -303,7 +506,7 @@ class Transcriber(threading.Thread):
         queues = []
         if args.source in ("mic", "both"):
             mic_dev = sc.default_microphone()
-            q = queue.Queue(maxsize=24)
+            q = queue.Queue(maxsize=64)
             Recorder(mic_dev, q, self.stop_event, "마이크").start()
             queues.append(["마이크", q])
             self.ui_q.put(("status_add", f"마이크: {mic_dev.name}"))
@@ -312,7 +515,7 @@ class Transcriber(threading.Thread):
             sys_dev = find_system_audio_device(args.system_device) if args.system_device else None
             tap_bin = find_macos_audio_tap_binary() if sys_dev is None else None
             if tap_bin is not None:
-                q = queue.Queue(maxsize=24)
+                q = queue.Queue(maxsize=64)
                 ScreenCaptureKitRecorder(tap_bin, q, self.stop_event, "시스템").start()
                 queues.append(["시스템", q])
                 self.ui_q.put(("status_add", "시스템: ScreenCaptureKit (내장 루프백)"))
@@ -320,7 +523,7 @@ class Transcriber(threading.Thread):
                 if sys_dev is None:
                     sys_dev = find_system_audio_device(None)
                 if sys_dev is not None:
-                    q = queue.Queue(maxsize=24)
+                    q = queue.Queue(maxsize=64)
                     Recorder(sys_dev, q, self.stop_event, "시스템").start()
                     queues.append(["시스템", q])
                     self.ui_q.put(("status_add", f"시스템: {sys_dev.name}"))
@@ -333,7 +536,7 @@ class Transcriber(threading.Thread):
                     )
                     if not any(lbl == "마이크" for lbl, _ in queues):
                         mic_dev = sc.default_microphone()
-                        q = queue.Queue(maxsize=24)
+                        q = queue.Queue(maxsize=64)
                         Recorder(mic_dev, q, self.stop_event, "마이크").start()
                         queues.append(["마이크", q])
                         self.ui_q.put(("status_add", f"마이크: {mic_dev.name}"))
@@ -345,8 +548,8 @@ class Transcriber(threading.Thread):
         else:
             self._run_chunk_loop(model, queues, out_path, args)
 
-    def _read_mixed_block(self, queues):
-        mixed = None
+    def _read_channel_blocks(self, queues):
+        blocks = {}
         dead_indices = []
         for idx, (label, q) in enumerate(queues):
             item = q.get()
@@ -354,168 +557,514 @@ class Transcriber(threading.Thread):
                 self.ui_q.put(("error", str(item)))
                 dead_indices.append(idx)
                 continue
-            mixed = item if mixed is None else mixed + item
+            blocks[label] = item
 
         for idx in reversed(dead_indices):
             queues.pop(idx)
 
-        if mixed is None:
+        if not blocks:
             return None
+        return blocks
 
-        if len(queues) > 1:
-            peak = float(np.max(np.abs(mixed)))
-            if peak > 1.0:
-                mixed = mixed / peak
-        return mixed
-
-    def _commit_text(self, text: str, out_path: str):
+    def _commit_text(
+        self,
+        text: str,
+        out_path: str,
+        utt_rms: float = 1.0,
+        source_label: str | None = None,
+    ):
         text = (text or "").strip()
         if not text:
             return
+        # 문장 내 연속 구문 반복 루프("I'm a big set I'm a big set...", "너 이름은 뭐야? 너 이름은 뭐야?") 제거
+        words = text.split()
+        if len(words) >= 4:
+            cleaned_words = []
+            i = 0
+            n = len(words)
+            while i < n:
+                collapsed = False
+                for span in range(min(8, (n - i) // 2), 0, -1):
+                    phrase = [w.strip(".,?!~") for w in words[i : i + span]]
+                    nxt = [w.strip(".,?!~") for w in words[i + span : i + 2 * span]]
+                    if phrase == nxt and (span >= 2 or ( i + 3 * span <= n and [w.strip(".,?!~") for w in words[i + 2 * span : i + 3 * span]] == phrase )):
+                        cleaned_words.extend(words[i : i + span])
+                        i += 2 * span
+                        while i + span <= n and [w.strip(".,?!~") for w in words[i : i + span]] == phrase:
+                            i += span
+                        collapsed = True
+                        break
+                if not collapsed:
+                    cleaned_words.append(words[i])
+                    i += 1
+            text = " ".join(cleaned_words).strip()
+
+        last_map = getattr(self, "_last_committed_by_source", None)
+        if last_map is None:
+            last_map = {}
+            self._last_committed_by_source = last_map
+        key = source_label or "default"
+        prev_committed = last_map.get(key, "")
+        text = _stitch_overlap_text(prev_committed, text)
+        if not text:
+            return
+        # 직전 확정 문장과 정규화 기준 완전히 동일하면서 저에너지(소음/숨소리)인 경우 중복 출력 차단
+        norm_cur = "".join(ch for ch in text if ch.isalnum())
+        norm_prev = "".join(ch for ch in prev_committed if ch.isalnum())
+        if norm_cur and norm_cur == norm_prev and utt_rms < 0.020:
+            return
+        stripped = text.rstrip(".?!,~ ")
+        compact_stripped = stripped.replace(" ", "")
+        if (
+            stripped in {"다", "요", "음", "응", "흠", "으", "그", "부", "이", "저"}
+            or set(compact_stripped) <= {"음", "응", "어", "아", "으", "흠", "그"}
+            or (utt_rms < 0.025 and len(compact_stripped) <= 1 and compact_stripped not in {"네", "예"})
+        ):
+            return
+        last_map[key] = text
         stamp = dt.datetime.now().strftime("%H:%M:%S")
-        line = f"[{stamp}] {text}"
+        if source_label:
+            line = f"[{stamp}] [{source_label}] {text}"
+        else:
+            line = f"[{stamp}] {text}"
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
         self.ui_q.put(("text", line))
 
     def _run_mlx_streaming_loop(self, engine, queues, out_path, args):
         """
-        MLX 4-bit 실시간 스트리밍 루프:
-        - 0.5초 블록마다 음성을 감지하고, 발화 중에는 1.0초마다 Prefix-Rollback 스트리밍으로
-          중간 결과("partial")를 UI에 즉시 전송한다.
-        - 발화 후 무음(1.0초 이상)이 이어지거나 최대 발화 길이(max_sec)에 도달하면
-          문장을 확정("text")하고 파일에 저장한다.
+        고정밀 듀얼 채널 분리 실시간 스트리밍 파이프라인 (시스템 소리 / 마이크 독립 전사):
+        1) 시스템(ScreenCaptureKit 디지털 원음)과 마이크(사용자 음성)를 합산(Mix)하지 않고
+           각각 독립된 스트리밍 상태 머신 및 독립 VAD로 분리 전사
+        2) 스피커 출력음이 마이크로 역유입(Bleed)될 때 마이크 채널에 동적 에코 게이트를 적용해
+           시스템 소리가 마이크 카드로 중복 전사되거나 파형이 오염되는 현상을 원천 차단
+        3) 공식 Qwen3-ASR 1.0초 청크 + unfixed_chunk_num=2 / unfixed_token_num=5 프리픽스 롤백
         """
+        from collections import deque
         import gc
         import mlx.core as mx
 
-        max_utterance_sec = max(6.0, float(args.chunk) * 1.5)
-        state = None
-        last_nonempty_partial = ""
-        silent_blocks = 0
-        active_sec = 0.0
+        soft_split_sec = max(10.0, float(args.chunk) * 1.8)
+        hard_ceiling_sec = max(16.0, float(args.chunk) * 2.6)
+
+        def _make_channel():
+            return {
+                "state": None,
+                "last_nonempty_partial": "",
+                "recent_committed": deque(maxlen=10),
+                "preroll_blocks": deque(maxlen=2),
+                "band_history": deque(maxlen=80),
+                "utterance_band_energies": [],
+                "silent_blocks": 0,
+                "active_sec": 0.0,
+                "from_carryover": False,
+                "new_speech_blocks": 0,
+            }
+
+        channels = {label: _make_channel() for label, _ in queues}
+        sys_ref_ring = deque(maxlen=8)  # 최근 2.0초(8블록) 시스템 오디오 레퍼런스 링버퍼
+        sys_active_holdover = 0  # 시스템 오디오 재생 중 + 종료 후 1.5초(6블록) 스피커 잔향 홀드오버
+        mic_bleed_history = deque(maxlen=48)  # 스피커 재생 중 마이크로 유입되는 잔향 에너지 분포
+        mic_direct_speech_streak = 0  # 사용자가 마이크 앞에서 직접 발화한 연속 블록 수
         step_counter = 0
 
+        def _get_sys_reference_texts():
+            sys_ch = channels.get("시스템")
+            if not sys_ch:
+                return []
+            texts = list(sys_ch["recent_committed"])
+            if sys_ch["last_nonempty_partial"]:
+                texts.append(sys_ch["last_nonempty_partial"])
+            if sys_ch["state"] is not None and getattr(sys_ch["state"], "text", ""):
+                texts.append(sys_ch["state"].text)
+            return texts
+
+        def _init_new_state(carryover_audio=None, ch_obj=None):
+            # Qwen3-ASR의 <system> context에 이전 전사 문장을 넣으면 저에너지/짧은 발화 구간에서
+            # 시스템 프롬프트를 그대로 앵무새처럼 복창(Parroting)하는 현상이 발생하므로 context=""로 고정한다.
+            st = engine.init_streaming_state(
+                language="Korean",
+                context="",
+                chunk_size_sec=1.0,
+                unfixed_chunk_num=4,
+                unfixed_token_num=12,
+            )
+            if carryover_audio is not None and carryover_audio.size > 0:
+                st.audio_accum = carryover_audio.astype(np.float32, copy=True)
+            return st
+
         while not self.stop_event.is_set():
-            block = self._read_mixed_block(queues)
-            if block is None:
+            blocks = self._read_channel_blocks(queues)
+            if blocks is None:
                 return
 
-            rms = float(np.sqrt(np.mean(block**2)))
-            level_norm = min(1.0, rms / 0.08)
+            if "시스템" in blocks:
+                sys_ref_ring.append(blocks["시스템"].astype(np.float32, copy=True))
+
+            max_level_norm = 0.0
+            band_rms_map = {}
+            raw_rms_map = {}
+            for label, blk in blocks.items():
+                r_rms = float(np.sqrt(np.mean(blk**2)))
+                b_rms = _speech_band_rms(blk)
+                raw_rms_map[label] = r_rms
+                band_rms_map[label] = b_rms
+                max_level_norm = max(max_level_norm, min(1.0, max(r_rms, b_rms) / 0.08))
+
             step_counter += 1
-            if step_counter % 2 == 0:
+            if step_counter % 4 == 0:
                 active_mb = mx.get_active_memory() / (1024 * 1024)
                 cache_mb = mx.get_cache_memory() / (1024 * 1024)
-                self.ui_q.put(("telemetry", (round(level_norm, 3), round(active_mb + cache_mb, 1))))
-            else:
-                self.ui_q.put(("level", round(level_norm, 3)))
+                self.ui_q.put(
+                    ("telemetry", (round(max_level_norm, 3), round(active_mb + cache_mb, 1)))
+                )
+            elif step_counter % 2 == 0:
+                self.ui_q.put(("level", round(max_level_norm, 3)))
 
-            is_silent = rms < args.silence
+            sys_band_rms = band_rms_map.get("시스템", 0.0)
+            sys_hist_band_rms = (
+                max(_speech_band_rms(b) for b in sys_ref_ring)
+                if len(sys_ref_ring) > 0
+                else 0.0
+            )
+            effective_sys_rms = max(sys_band_rms, sys_hist_band_rms * 0.90)
+            sys_ch_obj = channels.get("시스템")
+            sys_state_open = (
+                sys_ch_obj is not None and sys_ch_obj.get("state") is not None
+            )
+            if sys_band_rms > 0.0028 or effective_sys_rms > 0.0035 or sys_state_open:
+                sys_active_holdover = 6  # 1.50초 동안 스피커 잔향 및 큐 지연 완전 차폐
+            elif sys_active_holdover > 0:
+                sys_active_holdover -= 1
 
-            if is_silent:
-                if state is None:
-                    continue
-                silent_blocks += 1
-                # 발화 중 잠깐 쉬는 호흡(0.5초)은 버퍼에 포함하되, 이미 인식된 텍스트는 절대 지우지 않는다
-                if silent_blocks < 2:
-                    engine.streaming_transcribe(block, state)
-                    if state.text:
-                        last_nonempty_partial = state.text
-                        self.ui_q.put(("partial", state.text))
-                    continue
+            # 시스템 오디오를 먼저 처리하고 마이크를 처리한다
+            ordered_labels = [lbl for lbl in ("시스템", "마이크") if lbl in blocks]
+            for lbl in blocks:
+                if lbl not in ordered_labels:
+                    ordered_labels.append(lbl)
 
-                try:
-                    engine.finish_streaming_transcribe(state)
-                    final_text = (state.text or "").strip() or last_nonempty_partial.strip()
-                    self.ui_q.put(("partial", ""))
-                    if final_text:
-                        self._commit_text(final_text, out_path)
-                except Exception as e:
-                    if last_nonempty_partial.strip():
-                        self._commit_text(last_nonempty_partial.strip(), out_path)
-                    self.ui_q.put(("error", f"스트리밍 마감 오류: {e}"))
-                state = None
-                last_nonempty_partial = ""
-                silent_blocks = 0
-                active_sec = 0.0
-                mx.clear_cache()
-                gc.collect()
-                continue
+            for label in ordered_labels:
+                block = blocks[label]
+                if label not in channels:
+                    channels[label] = _make_channel()
+                ch = channels[label]
 
-            # 소리가 있는 블록
-            silent_blocks = 0
-            peak = float(np.max(np.abs(block)))
-            if 0 < peak < 0.4:
-                block = block * min(3.0, 0.4 / peak)
+                band_rms = band_rms_map[label]
+                ch["band_history"].append(band_rms)
 
-            if state is None:
-                last_nonempty_partial = ""
-                state = engine.init_streaming_state(
-                    language="Korean",
-                    chunk_size_sec=1.0,
-                    unfixed_chunk_num=1,
-                    unfixed_token_num=2,
+                sub_len = max(1, block.shape[0] // 3)
+                sub_max_band = max(
+                    _speech_band_rms(block[:sub_len]),
+                    _speech_band_rms(block[sub_len : 2 * sub_len]),
+                    _speech_band_rms(block[2 * sub_len :]),
                 )
 
-            prev_chunk_id = state.chunk_id
-            try:
-                engine.streaming_transcribe(block, state)
-                active_sec += BLOCK_SEC
-                if state.text:
-                    last_nonempty_partial = state.text
-                if state.chunk_id != prev_chunk_id and last_nonempty_partial:
-                    self.ui_q.put(("partial", last_nonempty_partial))
-            except Exception as e:
-                self.ui_q.put(("error", f"스트리밍 전사 오류: {e}"))
-                state = None
-                last_nonempty_partial = ""
-                active_sec = 0.0
-                mx.clear_cache()
-                continue
+                if len(ch["band_history"]) >= 8:
+                    noise_floor = min(0.0085, float(np.percentile(ch["band_history"], 5)))
+                else:
+                    noise_floor = min(0.0075, args.silence * 0.5)
 
-            if active_sec >= max_utterance_sec:
+                speech_threshold = max(
+                    0.0048, min(0.0105, noise_floor * 1.45, args.silence * 0.55)
+                )
+                # 시스템 오디오가 출력 중이거나 직전 1.5초 잔향 구간(sys_active_holdover > 0)일 때:
+                # STFT 파형 왜곡 없이(뮤지컬 노이즈 환각 방지), 적응형 스피커 역유입 게이트(Adaptive Bleed Ducking Gate)로
+                # 스피커 소리가 마이크 카드로 전사되는 것을 완벽 차단한다.
+                is_echo_bleed = False
+                if label == "마이크":
+                    if sys_active_holdover > 0:
+                        bleed_p95 = (
+                            float(np.percentile(mic_bleed_history, 95))
+                            if len(mic_bleed_history) >= 4
+                            else 0.022
+                        )
+                        direct_voice_thresh = max(
+                            0.058, bleed_p95 * 2.8, effective_sys_rms * 1.85
+                        )
+                        if (
+                            band_rms >= direct_voice_thresh
+                            and sub_max_band >= direct_voice_thresh * 1.15
+                        ):
+                            mic_direct_speech_streak += 1
+                        else:
+                            mic_direct_speech_streak = 0
+                            if band_rms < 0.075:
+                                mic_bleed_history.append(band_rms)
+
+                        if mic_direct_speech_streak < 2:
+                            is_echo_bleed = True
+                            # 스피커 소리가 먼저 마이크를 살짝 열었을 경우 즉시 폐기하여 잔향 문장 확정 차단
+                            if ch["state"] is not None and ch["active_sec"] < 2.25:
+                                ch["state"] = None
+                                ch["last_nonempty_partial"] = ""
+                                ch["utterance_band_energies"].clear()
+                                ch["preroll_blocks"].clear()
+                                ch["silent_blocks"] = 0
+                                ch["active_sec"] = 0.0
+                                ch["from_carryover"] = False
+                                ch["new_speech_blocks"] = 0
+                                self.ui_q.put(("partial", f"[{label}] "))
+                                continue
+                    else:
+                        mic_direct_speech_streak = 0
+
+                is_silent = is_echo_bleed or (
+                    (band_rms < speech_threshold)
+                    and (sub_max_band < speech_threshold * 1.18)
+                )
+
+                state = ch["state"]
+                active_sec = ch["active_sec"]
+                utterance_band_energies = ch["utterance_band_energies"]
+
+                if is_silent:
+                    if state is None:
+                        if not is_echo_bleed:
+                            ch["preroll_blocks"].append(block)
+                        continue
+
+                    ch["silent_blocks"] += 1
+                    required_pause_blocks = 2 if active_sec >= soft_split_sec else 3
+
+                    if ch["silent_blocks"] < required_pause_blocks:
+                        if not is_echo_bleed:
+                            engine.streaming_transcribe(block, state)
+                            if state.text:
+                                if label == "마이크" and _is_text_echo_of_system(
+                                    state.text, _get_sys_reference_texts()
+                                ):
+                                    self.ui_q.put(("partial", f"[{label}] "))
+                                else:
+                                    ch["last_nonempty_partial"] = state.text
+                                    self.ui_q.put(("partial", f"[{label}] {state.text}"))
+                        continue
+
+                    utt_rms = (
+                        float(np.median(utterance_band_energies))
+                        if utterance_band_energies
+                        else 1.0
+                    )
+                    # 1) hard_ceiling_sec 분할 직후 새로운 발화 없이 꼬리 무음으로 끝난 경우("습니다." 등) 중복 조각 폐기
+                    # 2) 단일 블록(0.25초) 미세 소음/타건음(utt_rms < 0.012)으로 열린 경우 환각 방지 폐기
+                    if (ch.get("from_carryover") and ch.get("new_speech_blocks", 0) <= 2) or (
+                        not ch.get("from_carryover")
+                        and ch.get("new_speech_blocks", 0) <= 1
+                        and utt_rms < 0.012
+                    ):
+                        self.ui_q.put(("partial", f"[{label}] "))
+                        ch["state"] = None
+                        ch["last_nonempty_partial"] = ""
+                        utterance_band_energies.clear()
+                        ch["preroll_blocks"].clear()
+                        ch["silent_blocks"] = 0
+                        ch["active_sec"] = 0.0
+                        ch["from_carryover"] = False
+                        ch["new_speech_blocks"] = 0
+                        mx.clear_cache()
+                        gc.collect()
+                        continue
+                    try:
+                        engine.finish_streaming_transcribe(state)
+                        final_text = (
+                            (state.text or "").strip()
+                            or ch["last_nonempty_partial"].strip()
+                        )
+                        self.ui_q.put(("partial", f"[{label}] "))
+                        if final_text and not (
+                            label == "마이크"
+                            and _is_text_echo_of_system(
+                                final_text, _get_sys_reference_texts()
+                            )
+                        ):
+                            self._commit_text(
+                                final_text,
+                                out_path,
+                                utt_rms=utt_rms,
+                                source_label=label,
+                            )
+                            ch["recent_committed"].append(final_text)
+                    except Exception as e:
+                        cand = ch["last_nonempty_partial"].strip()
+                        if cand and not (
+                            label == "마이크"
+                            and _is_text_echo_of_system(cand, _get_sys_reference_texts())
+                        ):
+                            self._commit_text(
+                                cand,
+                                out_path,
+                                utt_rms=utt_rms,
+                                source_label=label,
+                            )
+                            ch["recent_committed"].append(cand)
+                        self.ui_q.put(("error", f"[{label}] 스트리밍 마감 오류: {e}"))
+
+                    ch["state"] = None
+                    ch["last_nonempty_partial"] = ""
+                    utterance_band_energies.clear()
+                    ch["preroll_blocks"].clear()
+                    if not is_echo_bleed:
+                        ch["preroll_blocks"].append(block)
+                    ch["silent_blocks"] = 0
+                    ch["active_sec"] = 0.0
+                    ch["from_carryover"] = False
+                    ch["new_speech_blocks"] = 0
+                    mx.clear_cache()
+                    gc.collect()
+                    continue
+
+                ch["silent_blocks"] = 0
+                ch["new_speech_blocks"] = ch.get("new_speech_blocks", 0) + 1
+                utterance_band_energies.append(band_rms)
+
+                if state is None:
+                    ch["last_nonempty_partial"] = ""
+                    ch["from_carryover"] = False
+                    ch["new_speech_blocks"] = 1
+                    carry = (
+                        np.concatenate(list(ch["preroll_blocks"]))
+                        if len(ch["preroll_blocks"]) > 0
+                        else None
+                    )
+                    ch["preroll_blocks"].clear()
+                    state = _init_new_state(carryover_audio=carry, ch_obj=ch)
+                    ch["state"] = state
+
+                if active_sec + BLOCK_SEC >= hard_ceiling_sec:
+                    carryover = np.zeros((0,), dtype=np.float32)
+                    try:
+                        state.buffer = np.concatenate(
+                            [state.buffer, block.astype(np.float32, copy=False)]
+                        )
+                        if state.buffer.shape[0] > 0:
+                            state.audio_accum = np.concatenate(
+                                [state.audio_accum, state.buffer]
+                            )
+                            state.buffer = np.zeros((0,), dtype=np.float32)
+
+                        total_sec = state.audio_accum.shape[0] / float(SAMPLE_RATE)
+                        fa_split = None
+                        if hasattr(engine, "split_at_word_boundary") and getattr(engine, "forced_aligner", None) is not None:
+                            fa_split = engine.split_at_word_boundary(
+                                state,
+                                min_sec=max(soft_split_sec - 2.0, total_sec - 5.0),
+                                max_sec=max(soft_split_sec + 1.0, total_sec - 0.35),
+                                sr=SAMPLE_RATE,
+                            )
+
+                        if fa_split is not None:
+                            final_text, carryover = fa_split
+                            final_text = (final_text or "").strip()
+                        else:
+                            split_idx = _find_valley_split_sample(
+                                state.audio_accum,
+                                min_sec=max(soft_split_sec, total_sec - 4.0),
+                                max_sec=max(soft_split_sec + 1.0, total_sec - 0.35),
+                                sr=SAMPLE_RATE,
+                            )
+                            if 0 < split_idx < state.audio_accum.shape[0]:
+                                # 0.35초(5600샘플) 컨텍스트 오버랩을 carryover에 포함해 어절 절단("시키겠" / "습니다") 방지
+                                overlap_start = max(0, split_idx - int(0.35 * SAMPLE_RATE))
+                                carryover = state.audio_accum[overlap_start:].copy()
+                                state.audio_accum = state.audio_accum[:split_idx]
+                                setattr(state, "_valley_truncated", True)
+
+                            engine.finish_streaming_transcribe(state)
+                            final_text = (state.text or "").strip()
+
+                        self.ui_q.put(("partial", f"[{label}] "))
+                        if final_text and not (
+                            label == "마이크"
+                            and _is_text_echo_of_system(
+                                final_text, _get_sys_reference_texts()
+                            )
+                        ):
+                            self._commit_text(
+                                final_text, out_path, source_label=label
+                            )
+                            ch["recent_committed"].append(final_text)
+                    except Exception as e:
+                        cand = ch["last_nonempty_partial"].strip()
+                        if cand and not (
+                            label == "마이크"
+                            and _is_text_echo_of_system(cand, _get_sys_reference_texts())
+                        ):
+                            self._commit_text(
+                                cand,
+                                out_path,
+                                source_label=label,
+                            )
+                            ch["recent_committed"].append(cand)
+                        self.ui_q.put(
+                            ("error", f"[{label}] 스트리밍 구간 확정 오류: {e}")
+                        )
+
+                    utterance_band_energies.clear()
+                    ch["silent_blocks"] = 0
+                    if carryover.size > 0:
+                        ch["active_sec"] = carryover.shape[0] / float(SAMPLE_RATE)
+                        ch["last_nonempty_partial"] = ""
+                        ch["from_carryover"] = True
+                        ch["new_speech_blocks"] = 0
+                        ch["state"] = _init_new_state(carryover_audio=carryover, ch_obj=ch)
+                    else:
+                        ch["state"] = None
+                        ch["last_nonempty_partial"] = ""
+                        ch["active_sec"] = 0.0
+                        ch["from_carryover"] = False
+                        ch["new_speech_blocks"] = 0
+                    mx.clear_cache()
+                    gc.collect()
+                    continue
+
+                prev_chunk_id = state.chunk_id
                 try:
-                    engine.finish_streaming_transcribe(state)
-                    final_text = (state.text or "").strip() or last_nonempty_partial.strip()
-                    self.ui_q.put(("partial", ""))
-                    if final_text:
-                        self._commit_text(final_text, out_path)
+                    engine.streaming_transcribe(block, state)
+                    ch["active_sec"] += BLOCK_SEC
+                    if state.text:
+                        if label == "마이크" and _is_text_echo_of_system(
+                            state.text, _get_sys_reference_texts()
+                        ):
+                            self.ui_q.put(("partial", f"[{label}] "))
+                        else:
+                            ch["last_nonempty_partial"] = state.text
+                            if state.chunk_id != prev_chunk_id:
+                                self.ui_q.put(
+                                    ("partial", f"[{label}] {ch['last_nonempty_partial']}")
+                                )
                 except Exception as e:
-                    if last_nonempty_partial.strip():
-                        self._commit_text(last_nonempty_partial.strip(), out_path)
-                    self.ui_q.put(("error", f"스트리밍 구간 확정 오류: {e}"))
-                state = None
-                last_nonempty_partial = ""
-                active_sec = 0.0
-                mx.clear_cache()
-                gc.collect()
+                    self.ui_q.put(("error", f"[{label}] 스트리밍 전사 오류: {e}"))
+                    ch["state"] = None
+                    ch["last_nonempty_partial"] = ""
+                    utterance_band_energies.clear()
+                    ch["active_sec"] = 0.0
+                    mx.clear_cache()
+                    continue
 
     def _run_chunk_loop(self, model, queues, out_path, args):
         blocks_per_chunk = max(1, int(round(args.chunk / BLOCK_SEC)))
         while not self.stop_event.is_set():
-            parts = []
+            parts_by_label = {}
             for _ in range(blocks_per_chunk):
-                b = self._read_mixed_block(queues)
-                if b is None:
+                blocks = self._read_channel_blocks(queues)
+                if blocks is None:
                     return
-                parts.append(b)
-            mixed = np.concatenate(parts)
+                for label, blk in blocks.items():
+                    parts_by_label.setdefault(label, []).append(blk)
 
-            rms = float(np.sqrt(np.mean(mixed**2)))
-            if rms < args.silence:
-                continue
-
-            peak = float(np.max(np.abs(mixed)))
-            if 0 < peak < 0.5:
-                mixed = mixed * (0.5 / peak)
-
-            try:
-                text = transcribe_array(model, mixed)
-            except Exception as e:
-                self.ui_q.put(("error", f"전사 오류: {e}"))
-                continue
-            self._commit_text(text, out_path)
+            for label, parts in parts_by_label.items():
+                chunk_audio = np.concatenate(parts)
+                rms = float(np.sqrt(np.mean(chunk_audio**2)))
+                if rms < args.silence:
+                    continue
+                peak = float(np.max(np.abs(chunk_audio)))
+                if 0 < peak < 0.5:
+                    chunk_audio = chunk_audio * (0.5 / peak)
+                try:
+                    text = transcribe_array(model, chunk_audio)
+                except Exception as e:
+                    self.ui_q.put(("error", f"[{label}] 전사 오류: {e}"))
+                    continue
+                self._commit_text(text, out_path, source_label=label)
 
 
 def main():

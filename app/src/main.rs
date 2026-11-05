@@ -723,8 +723,74 @@ fn spawn_backend(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
 struct TranscriptItem {
     index: usize,
     timestamp: Option<SharedString>,
+    source: Option<SharedString>,
     body: SharedString,
+    sentence_complete: bool,
     is_error: bool,
+}
+
+fn is_korean_sentence_end_word(word: &str, word_count_in_sentence: usize) -> bool {
+    let trimmed = word.trim_end_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '”' | '’'));
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(last_ch) = trimmed.chars().last() {
+        if matches!(last_ch, '?' | '!' | '…') {
+            return true;
+        }
+        if last_ch == '.' {
+            let stem = trimmed.trim_end_matches('.');
+            let is_number_dot = !stem.is_empty() && stem.chars().all(|c| c.is_ascii_digit());
+            if !is_number_dot {
+                return true;
+            }
+        }
+    }
+    if word_count_in_sentence >= 3 {
+        let clean = trimmed.trim_end_matches(|c: char| c.is_ascii_punctuation());
+        const ENDINGS: &[&str] = &[
+            "습니다", "ㅂ니다", "입니다", "였습니다", "겠습니다", "랍니다",
+            "네요", "군요", "어요", "아요", "해요", "예요", "이에요", "거예요",
+            "까요", "나요", "가요", "지요", "죠", "세", "십시오",
+            "했다", "됐다", "한다", "된다", "있다", "없다", "이다", "였다", "겠다",
+        ];
+        if ENDINGS.iter().any(|e| clean.ends_with(e)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 연속 전사된 텍스트를 문장 단위로 깔끔하게 분리한다.
+/// 반환값: `Vec<(문장 텍스트, 문장 종결 여부)>`
+fn split_into_sentences(text: &str) -> Vec<(String, bool)> {
+    let mut results = Vec::new();
+    let mut current_words: Vec<&str> = Vec::new();
+
+    for word in text.split_whitespace() {
+        current_words.push(word);
+        if is_korean_sentence_end_word(word, current_words.len()) {
+            results.push((current_words.join(" "), true));
+            current_words.clear();
+        }
+    }
+
+    if !current_words.is_empty() {
+        results.push((current_words.join(" "), false));
+    }
+
+    results
+}
+
+fn parse_source_prefix(s: &str) -> (Option<SharedString>, &str) {
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[시스템]") {
+        return (Some(SharedString::from("시스템")), rest.trim_start());
+    }
+    if let Some(rest) = trimmed.strip_prefix("[마이크]") {
+        return (Some(SharedString::from("마이크")), rest.trim_start());
+    }
+    (None, trimmed)
 }
 
 struct TranscriptView {
@@ -736,7 +802,7 @@ struct TranscriptView {
     started_at: Instant,
     total_committed: usize,
     copied_index: Option<usize>, // Some(0) = all, Some(usize::MAX - 2) = drag range, Some(idx) = card #idx
-    // Drag-range selection state across transcript cards
+    // Drag-range selection state across sentence cards
     drag_anchor: Option<usize>,
     drag_current: Option<usize>,
     is_dragging_selection: bool,
@@ -745,6 +811,8 @@ struct TranscriptView {
     mem_mb: f32,
     status: VecDeque<SharedString>,
     partial: SharedString,
+    partial_sys: SharedString,
+    partial_mic: SharedString,
     items: VecDeque<TranscriptItem>,
     scroll: ScrollHandle,
     _backend: Option<Child>,
@@ -787,6 +855,8 @@ impl TranscriptView {
             mem_mb: 1105.5,
             status,
             partial: "".into(),
+            partial_sys: "".into(),
+            partial_mic: "".into(),
             items: VecDeque::with_capacity(MAX_TRANSCRIPT_ITEMS),
             scroll: ScrollHandle::new(),
             _backend: None,
@@ -826,35 +896,173 @@ impl TranscriptView {
         self.wave_history.push_back(self.audio_level.max(0.06));
     }
 
+    fn has_any_partial(&self) -> bool {
+        !self.partial_sys.trim().is_empty()
+            || !self.partial_mic.trim().is_empty()
+            || !self.partial.trim().is_empty()
+    }
+
+    fn partial_for_source(&self, source: &Option<SharedString>) -> SharedString {
+        match source.as_ref().map(|s| s.as_ref()) {
+            Some("시스템") => self.partial_sys.clone(),
+            Some("마이크") => self.partial_mic.clone(),
+            _ => self.partial.clone(),
+        }
+    }
+
     fn push_line(&mut self, raw: impl Into<String>, is_error: bool) {
         if self.paused && !is_error {
             return;
         }
         let s: String = raw.into();
-        let (timestamp, body) = if s.starts_with('[') {
+        let (timestamp, after_ts) = if s.starts_with('[') {
             if let Some(idx) = s.find("] ") {
-                (
-                    Some(SharedString::from(s[1..idx].to_string())),
-                    SharedString::from(s[idx + 2..].to_string()),
-                )
+                let tag = &s[1..idx];
+                if tag == "시스템" || tag == "마이크" {
+                    (None, s.as_str())
+                } else {
+                    (Some(SharedString::from(tag.to_string())), &s[idx + 2..])
+                }
             } else {
-                (None, SharedString::from(s))
+                (None, s.as_str())
             }
         } else {
-            (None, SharedString::from(s))
+            (None, s.as_str())
         };
 
-        self.total_committed += 1;
-        if self.items.len() >= MAX_TRANSCRIPT_ITEMS {
-            self.items.pop_front();
+        let (source, rest) = parse_source_prefix(after_ts);
+        let clean_body = rest.trim();
+        if clean_body.is_empty() {
+            return;
         }
-        self.items.push_back(TranscriptItem {
-            index: self.total_committed,
-            timestamp,
-            body,
-            is_error,
-        });
+
+        if is_error {
+            self.total_committed += 1;
+            if self.items.len() >= MAX_TRANSCRIPT_ITEMS {
+                self.items.pop_front();
+            }
+            self.items.push_back(TranscriptItem {
+                index: self.total_committed,
+                timestamp,
+                source,
+                body: SharedString::from(clean_body.to_string()),
+                sentence_complete: true,
+                is_error: true,
+            });
+            self.scroll.scroll_to_bottom();
+            return;
+        }
+
+        // 연속 전사된 텍스트를 문장 단위로 끊어서 처리하되,
+        // 직전 동일 채널(시스템/마이크) 카드가 아직 미완성 문장이면 자연스럽게 이어붙인 뒤 문장 완결 시 다음 카드로 분리한다.
+        let segments = split_into_sentences(clean_body);
+        for (seg_text, is_complete) in segments {
+            if seg_text.is_empty() {
+                continue;
+            }
+
+            let mut merged_into_open = false;
+            if let Some(open_item) = self
+                .items
+                .iter_mut()
+                .rev()
+                .find(|it| !it.is_error && it.source == source)
+            {
+                if !open_item.sentence_complete {
+                    let combined = if open_item.body.is_empty() {
+                        seg_text.clone()
+                    } else {
+                        format!("{} {}", open_item.body.trim_end(), seg_text)
+                    };
+                    let total_words = combined.split_whitespace().count();
+                    let last_w = combined.split_whitespace().last().unwrap_or("");
+                    let now_complete =
+                        is_complete || is_korean_sentence_end_word(last_w, total_words) || total_words >= 22;
+                    open_item.body = SharedString::from(combined);
+                    open_item.sentence_complete = now_complete;
+                    if open_item.timestamp.is_none() {
+                        open_item.timestamp = timestamp.clone();
+                    }
+                    merged_into_open = true;
+                }
+            }
+
+            if !merged_into_open {
+                self.total_committed += 1;
+                if self.items.len() >= MAX_TRANSCRIPT_ITEMS {
+                    self.items.pop_front();
+                }
+                let word_cnt = seg_text.split_whitespace().count();
+                self.items.push_back(TranscriptItem {
+                    index: self.total_committed,
+                    timestamp: timestamp.clone(),
+                    source: source.clone(),
+                    body: SharedString::from(seg_text),
+                    sentence_complete: is_complete || word_cnt >= 22,
+                    is_error: false,
+                });
+            }
+        }
         self.scroll.scroll_to_bottom();
+    }
+
+    fn full_continuous_text(&self) -> String {
+        let mut parts: Vec<String> = self
+            .items
+            .iter()
+            .filter(|it| !it.is_error && !it.body.trim().is_empty())
+            .map(|it| {
+                if let Some(ref src) = it.source {
+                    format!("[{}] {}", src, it.body.trim())
+                } else {
+                    it.body.trim().to_string()
+                }
+            })
+            .collect();
+        if !self.partial_sys.trim().is_empty() {
+            parts.push(format!("[시스템] {}", self.partial_sys.trim()));
+        }
+        if !self.partial_mic.trim().is_empty() {
+            parts.push(format!("[마이크] {}", self.partial_mic.trim()));
+        }
+        if !self.partial.trim().is_empty() {
+            parts.push(self.partial.trim().to_string());
+        }
+        parts.join("\n")
+    }
+
+    fn continuous_tail(&self, max_chars: usize) -> Option<SharedString> {
+        let mut stream_parts: Vec<String> = self
+            .items
+            .iter()
+            .filter(|it| !it.is_error && !it.body.trim().is_empty())
+            .map(|it| it.body.trim().to_string())
+            .collect();
+        if !self.partial_sys.trim().is_empty() {
+            stream_parts.push(self.partial_sys.trim().to_string());
+        }
+        if !self.partial_mic.trim().is_empty() {
+            stream_parts.push(self.partial_mic.trim().to_string());
+        }
+        if !self.partial.trim().is_empty() {
+            stream_parts.push(self.partial.trim().to_string());
+        }
+        let full = stream_parts.join(" ");
+        if full.is_empty() {
+            return None;
+        }
+        let total_chars = full.chars().count();
+        if total_chars <= max_chars {
+            return Some(SharedString::from(full));
+        }
+        let skip = total_chars.saturating_sub(max_chars);
+        let tail: String = full.chars().skip(skip).collect();
+        let clean_tail = if let Some((pos, _)) = tail.char_indices().take(12).find(|(_, c)| c.is_whitespace()) {
+            tail[pos..].trim_start()
+        } else {
+            tail.as_str()
+        };
+        Some(SharedString::from(format!("… {}", clean_tail)))
     }
 
     fn apply(&mut self, event: Event) {
@@ -862,7 +1070,12 @@ impl TranscriptView {
             Event::Msg(BackendMsg::Status { msg }) => self.push_status(msg),
             Event::Msg(BackendMsg::Partial { text }) => {
                 if !self.paused {
-                    self.partial = text.into();
+                    let (src, rest) = parse_source_prefix(&text);
+                    match src.as_ref().map(|s| s.as_ref()) {
+                        Some("시스템") => self.partial_sys = SharedString::from(rest.to_string()),
+                        Some("마이크") => self.partial_mic = SharedString::from(rest.to_string()),
+                        _ => self.partial = SharedString::from(rest.to_string()),
+                    }
                     self.scroll.scroll_to_bottom();
                 }
             }
@@ -871,9 +1084,28 @@ impl TranscriptView {
                 clock,
                 ..
             }) => {
-                self.partial = "".into();
+                let (_, after_clock) = if text.starts_with('[') {
+                    if let Some(idx) = text.find("] ") {
+                        let tag = &text[1..idx];
+                        if tag == "시스템" || tag == "마이크" {
+                            (None, text.as_str())
+                        } else {
+                            (Some(tag), &text[idx + 2..])
+                        }
+                    } else {
+                        (None, text.as_str())
+                    }
+                } else {
+                    (None, text.as_str())
+                };
+                let (src, _) = parse_source_prefix(after_clock);
+                match src.as_ref().map(|s| s.as_ref()) {
+                    Some("시스템") => self.partial_sys = "".into(),
+                    Some("마이크") => self.partial_mic = "".into(),
+                    _ => self.partial = "".into(),
+                }
                 let formatted = if let Some(c) = clock {
-                    if text.starts_with('[') {
+                    if text.starts_with('[') && !text.starts_with("[시스템]") && !text.starts_with("[마이크]") {
                         text
                     } else {
                         format!("[{c}] {text}")
@@ -939,6 +1171,8 @@ impl TranscriptView {
         self.paused = !self.paused;
         if self.paused {
             self.partial = "".into();
+            self.partial_sys = "".into();
+            self.partial_mic = "".into();
             self.audio_level = 0.0;
         }
         cx.notify();
@@ -947,6 +1181,8 @@ impl TranscriptView {
     fn clear_history(&mut self, cx: &mut Context<Self>) {
         self.items.clear();
         self.partial = "".into();
+        self.partial_sys = "".into();
+        self.partial_mic = "".into();
         self.copied_index = None;
         self.drag_anchor = None;
         self.drag_current = None;
@@ -964,28 +1200,17 @@ impl TranscriptView {
     }
 
     fn copy_all(&mut self, cx: &mut Context<Self>) {
-        let mut lines: Vec<String> = self
-            .items
-            .iter()
-            .filter(|it| !it.is_error)
-            .map(|it| match &it.timestamp {
-                Some(ts) => format!("[{}] {}", ts, it.body),
-                None => it.body.to_string(),
-            })
-            .collect();
-        if !self.partial.is_empty() {
-            lines.push(self.partial.to_string());
-        }
-        if lines.is_empty() {
+        let full = self.full_continuous_text();
+        if full.is_empty() {
             return;
         }
-        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        cx.write_to_clipboard(ClipboardItem::new_string(full));
         self.copied_index = Some(0);
         cx.notify();
     }
 
     // -----------------------------------------------------------------------
-    // Drag-to-Select & Copy Range Logic
+    // Sentence-Card Range Drag-to-Select & Copy
     // -----------------------------------------------------------------------
 
     fn selected_range(&self) -> Option<(usize, usize)> {
@@ -1058,7 +1283,7 @@ impl TranscriptView {
 
     fn render_waveform_bars(&self, bar_max_h: f32, max_bars: usize) -> impl IntoElement {
         let theme = self.preset.theme();
-        let is_active = !self.partial.is_empty() || self.audio_level > 0.08;
+        let is_active = self.has_any_partial() || self.audio_level > 0.08;
         let skip = self.wave_history.len().saturating_sub(max_bars);
         div()
             .flex_none()
@@ -1139,39 +1364,28 @@ impl TranscriptView {
     fn render_pip_overlay(&self, vw: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.preset.theme();
         let is_xs = vw < 430.0;
-        let has_partial = !self.partial.is_empty();
+        let has_partial = self.has_any_partial();
         let elapsed = self.format_elapsed();
         let mem_badge = SharedString::from(format!("{:.2} GB", self.mem_mb / 1024.0));
 
-        let latest_committed: Option<SharedString> =
-            self.items.back().map(|it| it.body.clone());
-
-        let copyable_pip: Option<String> = if has_partial {
-            Some(self.partial.to_string())
+        let tail_caption = self.continuous_tail(85);
+        let full_text = self.full_continuous_text();
+        let copyable_pip: Option<String> = if !full_text.is_empty() {
+            Some(full_text)
         } else {
-            latest_committed.as_ref().map(|s| s.to_string())
+            None
         };
         let pip_copied = self.copied_index == Some(usize::MAX);
 
         let primary_caption: SharedString = if self.paused {
             "일시정지됨 — 재개 버튼을 누르면 다시 실시간 전사를 시작합니다".into()
-        } else if has_partial {
-            self.partial.clone()
-        } else if let Some(ref last) = latest_committed {
-            last.clone()
+        } else if let Some(ref tail) = tail_caption {
+            tail.clone()
         } else {
             "Talk it, Get it. 말하는 순간, 바로 텍스트로.".into()
         };
 
-        let secondary_caption: Option<SharedString> = if has_partial {
-            latest_committed
-        } else if self.items.len() >= 2 {
-            self.items
-                .get(self.items.len() - 2)
-                .map(|it| it.body.clone())
-        } else {
-            None
-        };
+        let secondary_caption: Option<SharedString> = None;
 
         div()
             .size_full()
@@ -1521,8 +1735,43 @@ impl TranscriptView {
         let is_medium = vw < 860.0;
         let is_short = vh < 440.0;
 
-        let has_partial = !self.partial.is_empty();
-        let partial_text: SharedString = self.partial.clone();
+        let has_partial = self.has_any_partial();
+        let last_sys_open_idx = self
+            .items
+            .iter()
+            .rev()
+            .find(|it| !it.is_error && it.source.as_ref().map(|s| s.as_ref()) == Some("시스템"))
+            .and_then(|it| if !it.sentence_complete { Some(it.index) } else { None });
+        let last_mic_open_idx = self
+            .items
+            .iter()
+            .rev()
+            .find(|it| !it.is_error && it.source.as_ref().map(|s| s.as_ref()) == Some("마이크"))
+            .and_then(|it| if !it.sentence_complete { Some(it.index) } else { None });
+        let last_default_open_idx = self
+            .items
+            .iter()
+            .rev()
+            .find(|it| !it.is_error && it.source.is_none())
+            .and_then(|it| if !it.sentence_complete { Some(it.index) } else { None });
+
+        let mut pending_live_cards: Vec<(Option<SharedString>, SharedString)> = Vec::new();
+        if !self.partial_sys.trim().is_empty() && last_sys_open_idx.is_none() {
+            pending_live_cards.push((
+                Some(SharedString::from("시스템")),
+                SharedString::from(self.partial_sys.trim().to_string()),
+            ));
+        }
+        if !self.partial_mic.trim().is_empty() && last_mic_open_idx.is_none() {
+            pending_live_cards.push((
+                Some(SharedString::from("마이크")),
+                SharedString::from(self.partial_mic.trim().to_string()),
+            ));
+        }
+        if !self.partial.trim().is_empty() && last_default_open_idx.is_none() {
+            pending_live_cards.push((None, SharedString::from(self.partial.trim().to_string())));
+        }
+
         let elapsed = self.format_elapsed();
         let mem_badge = SharedString::from(if is_compact {
             format!("{:.1}GB", self.mem_mb / 1024.0)
@@ -1957,7 +2206,7 @@ impl TranscriptView {
                             .py_1()
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
-                            .when(self.items.is_empty(), |d| {
+                            .when(self.items.is_empty() && !has_partial, |d| {
                                 // Matches the "Brand Concept: Talk it, Get it. / 말하는 순간, 바로 텍스트로." card in the Guide
                                 d.child(
                                     div()
@@ -2009,19 +2258,56 @@ impl TranscriptView {
                                             div()
                                                 .text_size(px(12.0))
                                                 .text_color(rgba(theme.text_muted))
-                                                .child("문장 카드를 클릭하거나 마우스로 드래그하면 창 이동 없이 즉시 복사됩니다."),
+                                                .child("연속 스트리밍 전사 후 문장 단위로 자동 분리되며, 문장을 클릭하거나 드래그해 즉시 복사할 수 있습니다."),
                                         ),
                                 )
                             })
                             .children(self.items.iter().map(|item| {
                                 let is_err = item.is_error;
                                 let item_idx = item.index;
-                                let is_copied = self.copied_index == Some(item_idx);
+                                let is_copied = self.copied_index == Some(item_idx)
+                                    || (!is_err && self.copied_index == Some(0));
                                 let is_drag_selected = self.is_in_drag_selection(item_idx);
-                                let idx_label = SharedString::from(format!("#{:02}", item_idx));
+
+                                let is_mic =
+                                    item.source.as_ref().map(|s| s.as_ref()) == Some("마이크");
+                                let accent_color = if is_err {
+                                    0xfb7185ff
+                                } else if is_mic {
+                                    0x10b981ff
+                                } else {
+                                    TALKIT_BLUE
+                                };
+
+                                let idx_label = if is_err {
+                                    SharedString::from("오류")
+                                } else if let Some(ref src) = item.source {
+                                    SharedString::from(format!("{} #{}", src, item_idx))
+                                } else {
+                                    SharedString::from(format!("문장 #{}", item_idx))
+                                };
                                 let ts = item.timestamp.clone();
-                                let body = item.body.clone();
-                                let copy_str = item.body.to_string();
+
+                                let is_open_for_source = match item.source.as_ref().map(|s| s.as_ref()) {
+                                    Some("시스템") => Some(item_idx) == last_sys_open_idx,
+                                    Some("마이크") => Some(item_idx) == last_mic_open_idx,
+                                    _ => Some(item_idx) == last_default_open_idx,
+                                };
+                                let src_partial = self.partial_for_source(&item.source);
+                                let combined_body = if !is_err
+                                    && is_open_for_source
+                                    && !src_partial.trim().is_empty()
+                                {
+                                    SharedString::from(format!(
+                                        "{} {}",
+                                        item.body.trim_end(),
+                                        src_partial.trim()
+                                    ))
+                                } else {
+                                    item.body.clone()
+                                };
+                                let body = combined_body.clone();
+                                let copy_str = combined_body.to_string();
 
                                 div()
                                     .id(SharedString::from(format!("transcript-card-{}", item_idx)))
@@ -2061,7 +2347,7 @@ impl TranscriptView {
                                     .flex()
                                     .items_start()
                                     .gap(px(if is_compact { 8.0 } else { 12.0 }))
-                                    // Drag-to-select handlers
+                                    // Sentence card click / drag-to-select handlers
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -2081,7 +2367,7 @@ impl TranscriptView {
                                             this.copy_text(item_idx, copy_str.clone(), cx);
                                         }
                                     }))
-                                    // Left vertical Talkit Blue accent pill
+                                    // Left vertical source accent pill (Blue = 시스템, Emerald = 마이크)
                                     .child(
                                         div()
                                             .flex_none()
@@ -2089,13 +2375,9 @@ impl TranscriptView {
                                             .w(px(3.5))
                                             .h(px(20.0))
                                             .rounded(px(999.0))
-                                            .bg(rgba(if is_err {
-                                                0xfb7185ff
-                                            } else {
-                                                TALKIT_BLUE
-                                            })),
+                                            .bg(rgba(accent_color)),
                                     )
-                                    // Sequence + Timestamp pill in Talkit Gray (#E9EBF7)
+                                    // Source + Sentence Index + Timestamp pill
                                     .child(
                                         div()
                                             .flex_none()
@@ -2112,7 +2394,7 @@ impl TranscriptView {
                                             .text_size(px(11.0))
                                             .child(
                                                 div()
-                                                    .text_color(rgba(TALKIT_BLUE))
+                                                    .text_color(rgba(accent_color))
                                                     .child(idx_label),
                                             )
                                             .when(!is_compact, |d| {
@@ -2125,7 +2407,7 @@ impl TranscriptView {
                                                 })
                                             }),
                                     )
-                                    // Multi-line wrapping transcript utterance body
+                                    // Sentence text body
                                     .child(
                                         div()
                                             .flex_1()
@@ -2138,7 +2420,7 @@ impl TranscriptView {
                                             }))
                                             .child(body),
                                     )
-                                    // Copy action pill with SVG icon
+                                    // Copy action pill button
                                     .child(
                                         div()
                                             .flex_none()
@@ -2184,20 +2466,130 @@ impl TranscriptView {
                                                 })
                                             }),
                                     )
-                            })),
+                            }))
+                            // Live emerging sentence cards for any channel (`시스템` / `마이크`) starting a new sentence
+                            .children(pending_live_cards.into_iter().enumerate().map(
+                                |(live_i, (src_opt, live_txt))| {
+                                    let live_card_id = usize::MAX - 10 - live_i;
+                                    let is_mic =
+                                        src_opt.as_ref().map(|s| s.as_ref()) == Some("마이크");
+                                    let accent_color = if is_mic { 0x10b981ff } else { TALKIT_BLUE };
+                                    let badge_label = match src_opt.as_ref().map(|s| s.as_ref()) {
+                                        Some("시스템") => SharedString::from("시스템 실시간"),
+                                        Some("마이크") => SharedString::from("마이크 실시간"),
+                                        _ => SharedString::from("실시간 전사"),
+                                    };
+                                    let copy_live_str = live_txt.to_string();
+                                    let is_copied = self.copied_index == Some(live_card_id);
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "transcript-card-live-{}",
+                                            live_i
+                                        )))
+                                        .px(px(if is_compact { 12.0 } else { 16.0 }))
+                                        .py_2p5()
+                                        .rounded(px(18.0))
+                                        .cursor_pointer()
+                                        .bg(linear_gradient(
+                                            180.0,
+                                            linear_color_stop(rgba(theme.card_bg_top), 0.0),
+                                            linear_color_stop(rgba(theme.card_bg_bottom), 1.0),
+                                        ))
+                                        .border_1()
+                                        .border_color(rgba(accent_color))
+                                        .shadow(glass_card_shadows())
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(if is_compact { 8.0 } else { 12.0 }))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.copy_text(
+                                                live_card_id,
+                                                copy_live_str.clone(),
+                                                cx,
+                                            );
+                                        }))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .mt(px(3.0))
+                                                .w(px(3.5))
+                                                .h(px(20.0))
+                                                .rounded(px(999.0))
+                                                .bg(rgba(accent_color)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .mt(px(1.0))
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded(px(999.0))
+                                                .bg(rgba(theme.pill_bg))
+                                                .border_1()
+                                                .border_color(rgba(theme.pill_border))
+                                                .text_size(px(11.0))
+                                                .text_color(rgba(accent_color))
+                                                .child(badge_label),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .text_size(px(body_font))
+                                                .text_color(rgba(theme.text_primary))
+                                                .child(live_txt),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .h(px(24.0))
+                                                .px_2()
+                                                .rounded(px(999.0))
+                                                .bg(rgba(if is_copied {
+                                                    TALKIT_BLUE
+                                                } else {
+                                                    theme.pill_bg
+                                                }))
+                                                .border_1()
+                                                .border_color(rgba(if is_copied {
+                                                    TALKIT_BLUE
+                                                } else {
+                                                    theme.pill_border
+                                                }))
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .text_size(px(11.0))
+                                                .text_color(rgba(if is_copied {
+                                                    0xffffffff
+                                                } else {
+                                                    theme.text_secondary
+                                                }))
+                                                .child(icon_svg(
+                                                    if is_copied {
+                                                        "icons/check.svg"
+                                                    } else {
+                                                        "icons/copy.svg"
+                                                    },
+                                                    11.0,
+                                                    if is_copied {
+                                                        0xffffffff
+                                                    } else {
+                                                        theme.text_secondary
+                                                    },
+                                                ))
+                                                .when(!is_compact, |d| {
+                                                    d.child(if is_copied { "복사됨" } else { "복사" })
+                                                }),
+                                        )
+                                },
+                            )),
                     )
                     // 4. Inset Live Streaming Subtitle Bar (Talkit Brand Pill)
                     .child({
-                        let latest_committed_body = self.items.back().map(|it| it.body.clone());
-                        let dock_has_text = has_partial || latest_committed_body.is_some();
-                        let partial_for_copy = if has_partial {
-                            self.partial.to_string()
-                        } else {
-                            latest_committed_body
-                                .as_ref()
-                                .map(|s| s.to_string())
-                                .unwrap_or_default()
-                        };
+                        let tail_caption = self.continuous_tail(92);
+                        let dock_has_text = tail_caption.is_some();
+                        let partial_for_copy = self.full_continuous_text();
                         let live_copied = self.copied_index == Some(usize::MAX - 1);
                         div()
                             .id("bottom-live-dock")
@@ -2298,10 +2690,8 @@ impl TranscriptView {
                                             }))
                                             .child(if self.paused {
                                                 "전사가 일시정지되었습니다.".into()
-                                            } else if has_partial {
-                                                partial_text
-                                            } else if let Some(last_body) = latest_committed_body {
-                                                last_body
+                                            } else if let Some(tail) = tail_caption {
+                                                tail
                                             } else {
                                                 "말하는 순간, 바로 텍스트로 — 실시간 스트리밍 대기 중…".into()
                                             }),
