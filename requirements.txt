@@ -1,0 +1,5 @@
+qwen-asr
+torch
+numpy
+soundfile
+soundcard>=0.4.3
