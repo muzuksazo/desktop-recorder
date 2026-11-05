@@ -22,14 +22,14 @@ use std::{
 
 use futures::{channel::mpsc, StreamExt};
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, ScrollHandle, SharedString,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, list, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, Context, ListAlignment,
+    ListState, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use serde::Deserialize;
 use tts::Tts;
 
-/// TTS 가 소리를 낸 구간과 겹친 전사는 TTS 소리가 다시 잡힌 것으로 보고 버린다 (앞뒤 여유, 초)
-const TTS_ECHO_MARGIN: f64 = 0.5;
+/// TTS 가 읽던 시간과 겹치고 내용도 비슷한 전사는 TTS 소리가 다시 잡힌 것으로 보고 버린다 (앞뒤 여유, 초)
+const TTS_ECHO_MARGIN: f64 = 1.0;
 
 /// 백엔드가 stdout 으로 보내는 한 줄
 #[derive(Deserialize)]
@@ -98,7 +98,8 @@ struct Line {
 struct TranscriptView {
     status: Vec<SharedString>,
     lines: Vec<Line>,
-    scroll: ScrollHandle,
+    /// 채팅 기록처럼 아래에 붙는 목록 (맨 아래를 보고 있으면 새 줄을 따라간다)
+    list_state: ListState,
     backend: Option<Child>,
     tts: Tts,
     tts_voice: SharedString,
@@ -131,7 +132,7 @@ impl TranscriptView {
         let mut view = Self {
             status: vec!["백엔드 시작 중…".into()],
             lines: Vec::new(),
-            scroll: ScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Bottom, px(400.)),
             backend: None,
             tts,
             tts_voice: "음성 준비 중…".into(),
@@ -161,8 +162,26 @@ impl TranscriptView {
     }
 
     fn push_line(&mut self, text: impl Into<SharedString>, is_error: bool) {
+        let n = self.lines.len();
         self.lines.push(Line { text: text.into(), is_error });
-        self.scroll.scroll_to_bottom();
+        self.list_state.splice(n..n, 1);
+    }
+
+    fn render_line(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let line = &self.lines[ix];
+        div()
+            .id(("line", ix))
+            .px_1()
+            .py(px(2.))
+            .rounded_sm()
+            .when(line.is_error, |d| d.text_color(rgb(0xff8a80)))
+            .when(!line.is_error, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x2a2a2a)))
+                    .on_click(cx.listener(move |this, _, _, _| this.read_line(ix)))
+            })
+            .child(line.text.clone())
+            .into_any_element()
     }
 
     fn apply(&mut self, event: Event) {
@@ -170,7 +189,7 @@ impl TranscriptView {
             Event::Msg(BackendMsg::Status { msg }) => self.status.push(msg.into()),
             Event::Msg(BackendMsg::Text { text, clock, start, end, infer_sec }) => {
                 if let (Some(s), Some(e)) = (start, end) {
-                    if self.tts.overlaps(s, e, TTS_ECHO_MARGIN) {
+                    if self.tts.is_echo(&text, s, e, TTS_ECHO_MARGIN) {
                         self.echo_dropped += 1;
                         return;
                     }
@@ -217,7 +236,11 @@ fn button(id: &'static str, label: impl Into<SharedString>, active: bool) -> gpu
 
 impl Render for TranscriptView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let recent_status = self.status.iter().skip(self.status.len().saturating_sub(3)).cloned();
+        let recent_status = self
+            .status
+            .iter()
+            .skip(self.status.len().saturating_sub(3))
+            .map(|s| div().truncate().child(s.clone())); // 긴 경로는 … 으로 자름
         let mut info = vec![self.tts_voice.to_string()];
         if let Some(t) = self.last_infer {
             info.push(format!("마지막 전사 {t:.1}초"));
@@ -265,32 +288,15 @@ impl Render for TranscriptView {
                     .child(button("stop-read", "읽기 멈춤", false).on_click(cx.listener(|this, _, _, _| this.tts.stop())))
                     .child(div().text_color(rgb(0x9e9e9e)).child(format!("문장을 누르면 읽어 줘요 · {}", info.join(" · ")))),
             )
-            // 전사 결과
+            // 전사 결과 (아래에 붙는 목록: 맨 아래를 보고 있으면 새 줄을 따라감)
             .child(
-                div()
-                    .id("transcript")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .gap_1()
-                    .p_3()
-                    .text_lg()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .children(self.lines.iter().enumerate().map(|(ix, line)| {
-                        div()
-                            .id(("line", ix))
-                            .px_1()
-                            .rounded_sm()
-                            .when(line.is_error, |d| d.text_color(rgb(0xff8a80)))
-                            .when(!line.is_error, |d| {
-                                d.cursor_pointer()
-                                    .hover(|s| s.bg(rgb(0x2a2a2a)))
-                                    .on_click(cx.listener(move |this, _, _, _| this.read_line(ix)))
-                            })
-                            .child(line.text.clone())
-                    })),
+                div().flex_1().min_h(px(0.)).p_3().text_lg().child(
+                    list(
+                        self.list_state.clone(),
+                        cx.processor(|this, ix: usize, _window, cx| this.render_line(ix, cx)),
+                    )
+                    .size_full(),
+                ),
             )
     }
 }

@@ -1,8 +1,8 @@
 //! TTS: Windows 기본 음성(SAPI)으로 문장을 읽는다. 한국어 음성(예: Microsoft Heami)이 있으면 그걸 쓴다.
 //!
 //! - 전용 스레드 하나가 SAPI 를 들고 차례로 읽는다 (UI 를 막지 않음).
-//! - 읽은 시간 구간을 기록해 둔다. 시스템 소리를 전사할 때 TTS 소리가 다시 전사되는 걸
-//!   앱이 걸러 낼 수 있게 하기 위해서다 (`overlaps`).
+//! - 읽은 시간 구간과 글을 기록해 둔다. 시스템 소리를 전사할 때 TTS 소리가 다시 전사되는 걸
+//!   앱이 걸러 낼 수 있게 하기 위해서다 (`is_echo`).
 
 use std::{
     collections::VecDeque,
@@ -16,8 +16,29 @@ enum Cmd {
     Stop,
 }
 
-/// 읽은 구간 [시작, 끝] (Unix 초). 읽는 중이면 끝 = 무한대.
-type Spans = Arc<Mutex<Vec<(f64, f64)>>>;
+/// 읽은 구간 (시작, 끝, 읽은 글) — 시각은 Unix 초, 읽는 중이면 끝 = 무한대.
+type Spans = Arc<Mutex<Vec<(f64, f64, String)>>>;
+
+/// 두 문장이 얼마나 비슷한가 (0~1, 공백 무시 글자 2개 묶음 기준)
+fn similarity(a: &str, b: &str) -> f64 {
+    fn bigrams(s: &str) -> Vec<(char, char)> {
+        let cs: Vec<char> = s.chars().filter(|c| c.is_alphanumeric()).collect();
+        cs.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+    let (a, mut b) = (bigrams(a), bigrams(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let total = a.len() + b.len();
+    let mut common = 0;
+    for x in &a {
+        if let Some(i) = b.iter().position(|y| y == x) {
+            b.swap_remove(i);
+            common += 1;
+        }
+    }
+    2.0 * common as f64 / total as f64
+}
 
 #[derive(Clone)]
 pub struct Tts {
@@ -47,12 +68,20 @@ impl Tts {
         let _ = self.tx.send(Cmd::Stop);
     }
 
-    /// [start, end] 동안 TTS 가 소리를 내고 있었는가 (앞뒤 margin 초 여유).
-    pub fn overlaps(&self, start: f64, end: f64, margin: f64) -> bool {
+    /// 이 전사가 TTS 소리가 다시 녹음된 것(메아리)인가.
+    /// [start, end] 동안 TTS 가 읽고 있었고, 전사된 글이 그때 읽은 글과 비슷하면 메아리로 본다.
+    /// 시간만 겹치고 내용이 다르면(그동안 강사가 한 말) 메아리가 아니다.
+    pub fn is_echo(&self, text: &str, start: f64, end: f64, margin: f64) -> bool {
         let mut spans = self.spans.lock().unwrap();
         let cutoff = now_secs() - 120.0;
-        spans.retain(|&(_, e)| e > cutoff); // 2분 지난 기록은 버림
-        spans.iter().any(|&(s, e)| start < e + margin && end > s - margin)
+        spans.retain(|(_, e, _)| *e > cutoff); // 2분 지난 기록은 버림
+        let spoken: String = spans
+            .iter()
+            .filter(|(s, e, _)| start < e + margin && end > s - margin)
+            .map(|(_, _, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        !spoken.is_empty() && (similarity(text, &spoken) >= 0.5 || spoken.contains(text.trim()))
     }
 }
 
@@ -155,7 +184,7 @@ mod imp {
 
             let idx = {
                 let mut s = spans.lock().unwrap();
-                s.push((now_secs(), f64::INFINITY));
+                s.push((now_secs(), f64::INFINITY, text.clone()));
                 s.len() - 1
             };
             unsafe {
