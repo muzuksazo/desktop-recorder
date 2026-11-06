@@ -800,6 +800,9 @@ fn spawn_backend(
     if !model_choice.is_empty() {
         cmd.args(["--model-choice", model_choice]);
     }
+    if let Some(tk_key) = updates::embedded_model_key() {
+        cmd.env("TALKIT_MODEL_KEY", tk_key);
+    }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -829,14 +832,17 @@ fn scan_all_models() -> HashMap<&'static str, ModelState> {
 }
 
 fn spawn_model_download(tx: mpsc::UnboundedSender<Event>, model_id: &str) -> std::io::Result<Child> {
-    let mut child = Command::new(resolve_python_bin())
-        .args(["-X", "utf8"])
+    let mut cmd = Command::new(resolve_python_bin());
+    cmd.args(["-X", "utf8"])
         .arg(resolve_backend_script())
         .args(["--download-model", model_id])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+    if let Some(tk_key) = updates::embedded_model_key() {
+        cmd.env("TALKIT_MODEL_KEY", tk_key);
+    }
+    let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("stdout 을 piped 로 열었음");
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {

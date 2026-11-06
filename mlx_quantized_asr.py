@@ -85,6 +85,7 @@ R2_MODELS = {
     "qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
     "qwen3_forced_aligner_0.6b-RungOmega-MLX",
 }
+R2_DEFAULT_PUBLIC_BASE_URL = "https://pub-f068b5432e294a4889a36ffaa2242b54.r2.dev"
 
 
 def _load_r2_config() -> dict[str, str]:
@@ -214,7 +215,17 @@ def _download_from_r2(model_name: str, target: Path) -> bool:
             )
             file_entries.append({"name": fname, "size": fsize, "url": furl})
     else:
-        return False
+        pub_base = cfg.get("R2_PUBLIC_BASE_URL", R2_DEFAULT_PUBLIC_BASE_URL).rstrip("/")
+        manifest_url = f"{pub_base}/{urllib.parse.quote(model_name)}/manifest.json"
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "Talkit/1.4"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            manifest = json.loads(resp.read().decode("utf-8"))
+        total_bytes = int(manifest.get("total_bytes") or 0) or None
+        for item in manifest.get("files") or []:
+            fname = item["name"]
+            fsize = int(item.get("size") or 0)
+            furl = f"{pub_base}/{urllib.parse.quote(model_name)}/{urllib.parse.quote(fname)}"
+            file_entries.append({"name": fname, "size": fsize, "url": furl})
 
     if not file_entries:
         raise RuntimeError(f"R2 매니페스트에 파일 목록이 비어 있습니다: {model_name}")
@@ -265,7 +276,7 @@ def _download_from_r2(model_name: str, target: Path) -> bool:
             part.unlink(missing_ok=True)
             existing = 0
 
-        req = urllib.request.Request(furl)
+        req = urllib.request.Request(furl, headers={"User-Agent": "Talkit/1.4"})
         if existing > 0:
             req.add_header("Range", f"bytes={existing}-")
 

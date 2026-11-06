@@ -81,8 +81,26 @@ pub const MODELS: [ModelSpec; 4] = [
     },
 ];
 
+include!(concat!(env!("OUT_DIR"), "/tk_key.rs"));
+
+/// 빌드 시점에 네이티브 바이너리에 난독화되어 내장된 TKOMEGA1 모델 복호화 키를 메모리에서 복원한다.
+pub fn embedded_model_key() -> Option<String> {
+    if !TK_HAS_KEY {
+        return None;
+    }
+    let mut out = String::with_capacity(64);
+    for i in 0..32 {
+        let b = TK_ENC[i] ^ TK_MASK[i];
+        out.push_str(&format!("{:02x}", b));
+    }
+    Some(out)
+}
+
 pub fn has_r2_access() -> bool {
-    if env::var_os("TALKIT_R2_PRESIGN_URL").is_some() || env::var_os("R2_ACCESS_KEY_ID").is_some() {
+    if embedded_model_key().is_some()
+        || env::var_os("TALKIT_R2_PRESIGN_URL").is_some()
+        || env::var_os("R2_ACCESS_KEY_ID").is_some()
+    {
         return true;
     }
     let h = home();
