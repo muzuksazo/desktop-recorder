@@ -5,11 +5,16 @@ for `yeowon/qwen3_asr_1.7b_ko-MLX-4bit` and `TeamUNIVA/qwen3_asr_1.7b_ko`.
 """
 from __future__ import annotations
 
+import datetime
 import gc
+import hashlib
+import hmac
 import json
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, cast
@@ -75,15 +80,244 @@ def talkit_models_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Talkit" / "models"
 
 
+R2_MODELS = {
+    "qwen3_asr_1.7b_ko-RungOmega-MLX",
+    "qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
+    "qwen3_forced_aligner_0.6b-RungOmega-MLX",
+}
+
+
+def _load_r2_config() -> dict[str, str]:
+    """Cloudflare R2 설정을 환경변수 또는 ~/.config/talkit/r2.env 에서 읽는다."""
+    cfg: dict[str, str] = {}
+    for p in (
+        Path.home() / ".config" / "talkit" / "r2.env",
+        Path.home() / "Library" / "Application Support" / "Talkit" / "r2.env",
+    ):
+        if p.is_file():
+            try:
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+            except OSError:
+                pass
+            break
+    for k in (
+        "R2_ENDPOINT_URL",
+        "R2_BUCKET_NAME",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "TALKIT_R2_PRESIGN_URL",
+        "TALKIT_LICENSE_KEY",
+    ):
+        val = os.environ.get(k)
+        if val:
+            cfg[k] = val.strip()
+    return cfg
+
+
+def _r2_presign_get(
+    endpoint_url: str,
+    bucket: str,
+    key: str,
+    access_key: str,
+    secret_key: str,
+    expires: int = 3600,
+) -> str:
+    """외부 패키지 없이 표준 라이브러리만으로 Cloudflare R2(S3 호환) Presigned GET URL 을 만든다."""
+    parsed = urllib.parse.urlparse(endpoint_url)
+    host = parsed.netloc
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = now.strftime("%Y%m%d")
+    credential_scope = f"{datestamp}/auto/s3/aws4_request"
+    canonical_uri = "/" + urllib.parse.quote(f"{bucket}/{key.lstrip('/')}", safe="/-_.~")
+    params = [
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256"),
+        ("X-Amz-Credential", f"{access_key}/{credential_scope}"),
+        ("X-Amz-Date", amz_date),
+        ("X-Amz-Expires", str(expires)),
+        ("X-Amz-SignedHeaders", "host"),
+    ]
+    canonical_qs = "&".join(
+        f"{urllib.parse.quote(k, safe='-_.~')}={urllib.parse.quote(v, safe='-_.~')}"
+        for k, v in params
+    )
+    canonical_req = "\n".join(
+        [
+            "GET",
+            canonical_uri,
+            canonical_qs,
+            f"host:{host}\n",
+            "host",
+            "UNSIGNED-PAYLOAD",
+        ]
+    )
+    string_to_sign = "\n".join(
+        [
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_req.encode("utf-8")).hexdigest(),
+        ]
+    )
+
+    def _sign(k: bytes, msg: str) -> bytes:
+        return hmac.new(k, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _sign(("AWS4" + secret_key).encode("utf-8"), datestamp)
+    k_region = _sign(k_date, "auto")
+    k_service = _sign(k_region, "s3")
+    k_signing = _sign(k_service, "aws4_request")
+    sig = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{parsed.scheme}://{host}{canonical_uri}?{canonical_qs}&X-Amz-Signature={sig}"
+
+
+def _download_from_r2(model_name: str, target: Path) -> bool:
+    """Cloudflare R2 Presigned URL 로 모델을 내려받는다(중단 시 이어받기 지원).
+    R2 설정이 없으면 False 를 돌려준다."""
+    cfg = _load_r2_config()
+    presign_api = cfg.get("TALKIT_R2_PRESIGN_URL")
+    endpoint = cfg.get("R2_ENDPOINT_URL")
+    bucket = cfg.get("R2_BUCKET_NAME", "talkit-models")
+    access_key = cfg.get("R2_ACCESS_KEY_ID")
+    secret_key = cfg.get("R2_SECRET_ACCESS_KEY")
+
+    file_entries: list[dict] = []
+    total_bytes: Optional[int] = None
+
+    if presign_api:
+        sep = "&" if "?" in presign_api else "?"
+        req_url = f"{presign_api}{sep}model={urllib.parse.quote(model_name)}"
+        req = urllib.request.Request(req_url)
+        if cfg.get("TALKIT_LICENSE_KEY"):
+            req.add_header("Authorization", f"Bearer {cfg['TALKIT_LICENSE_KEY']}")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            manifest = json.loads(resp.read().decode("utf-8"))
+        total_bytes = int(manifest.get("total_bytes") or 0) or None
+        file_entries = manifest.get("files") or []
+    elif endpoint and access_key and secret_key:
+        manifest_url = _r2_presign_get(
+            endpoint, bucket, f"{model_name}/manifest.json", access_key, secret_key
+        )
+        with urllib.request.urlopen(manifest_url, timeout=20) as resp:
+            manifest = json.loads(resp.read().decode("utf-8"))
+        total_bytes = int(manifest.get("total_bytes") or 0) or None
+        for item in manifest.get("files") or []:
+            fname = item["name"]
+            fsize = int(item.get("size") or 0)
+            furl = _r2_presign_get(
+                endpoint, bucket, f"{model_name}/{fname}", access_key, secret_key
+            )
+            file_entries.append({"name": fname, "size": fsize, "url": furl})
+    else:
+        return False
+
+    if not file_entries:
+        raise RuntimeError(f"R2 매니페스트에 파일 목록이 비어 있습니다: {model_name}")
+
+    target.mkdir(parents=True, exist_ok=True)
+    if total_bytes is None:
+        total_bytes = sum(int(x.get("size") or 0) for x in file_entries) or None
+
+    approx_gb = f"{(total_bytes or 0) / 1e9:.1f}GB" if total_bytes else ""
+    _report(f"Cloudflare R2 에서 모델을 내려받는 중… ({approx_gb})")
+
+    completed_bytes = 0
+    last_emit = 0.0
+
+    def _emit_progress(current_got: int) -> None:
+        nonlocal last_emit
+        now = time.time()
+        if now - last_emit < 0.25 and current_got != total_bytes:
+            return
+        last_emit = now
+        if DOWNLOAD_HOOK is not None:
+            try:
+                DOWNLOAD_HOOK(current_got, total_bytes)
+            except Exception:
+                pass
+        if total_bytes:
+            pct = min(99, int(current_got * 100 / total_bytes))
+            _report(
+                f"모델 내려받는 중… {pct}% ({current_got // 2**20}/{total_bytes // 2**20}MB)"
+            )
+        else:
+            _report(f"모델 내려받는 중… {current_got // 2**20}MB")
+
+    for entry in file_entries:
+        fname = entry["name"]
+        fsize = int(entry.get("size") or 0)
+        furl = entry["url"]
+        dest = target / fname
+        part = target / f"{fname}.part"
+
+        if dest.exists() and (fsize <= 0 or dest.stat().st_size == fsize):
+            completed_bytes += dest.stat().st_size
+            _emit_progress(completed_bytes)
+            continue
+
+        existing = part.stat().st_size if part.exists() else 0
+        if fsize > 0 and existing > fsize:
+            part.unlink(missing_ok=True)
+            existing = 0
+
+        req = urllib.request.Request(furl)
+        if existing > 0:
+            req.add_header("Range", f"bytes={existing}-")
+
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status = getattr(resp, "status", 200)
+            mode = "ab" if (existing > 0 and status == 206) else "wb"
+            if mode == "wb":
+                existing = 0
+            cur = existing
+            with open(part, mode) as out_f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+                    cur += len(chunk)
+                    _emit_progress(completed_bytes + cur)
+
+        if fsize > 0 and part.stat().st_size != fsize:
+            raise RuntimeError(
+                f"파일 크기가 맞지 않습니다 ({fname}: {part.stat().st_size} != {fsize})"
+            )
+        part.replace(dest)
+        completed_bytes += dest.stat().st_size
+        _emit_progress(completed_bytes)
+
+    if not (target / "model.safetensors").exists():
+        raise RuntimeError(f"모델 파일이 없습니다: {target}")
+    (target / COMPLETE_MARKER).write_text(model_name + "\n")
+    _report("모델 준비 완료")
+    return True
+
+
 def resolve_model_dir(repo_id: str) -> Path:
-    """모델 폴더를 찾고, 없으면 처음 한 번만 Hugging Face 에서 내려받는다(진행률 표시)."""
-    target = talkit_models_dir() / repo_id.split("/")[-1]
+    """모델 폴더를 찾고, 없으면 처음 한 번만 Cloudflare R2 또는 Hugging Face 에서 내려받는다(진행률 표시)."""
+    model_name = repo_id.split("/")[-1]
+    target = talkit_models_dir() / model_name
     if model_is_complete(target):
         return target
     # 예전 개발용 위치(있는 Mac 에서만): 다시 내려받지 않는다
     legacy = Path.home() / "qwen3-asr-ko" / "qwen3_asr_1.7b_ko_mlx_4bit"
     if repo_id == DEFAULT_MLX_4BIT_MODEL and (legacy / "model.safetensors").exists():
         return legacy
+
+    if model_name in R2_MODELS:
+        try:
+            if _download_from_r2(model_name, target):
+                return target
+        except BaseException as e:  # noqa: BLE001
+            raise RuntimeError(
+                f"Cloudflare R2 에서 모델을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해 주세요. ({e})"
+            ) from e
 
     total = None
     try:

@@ -81,12 +81,23 @@ pub const MODELS: [ModelSpec; 4] = [
     },
 ];
 
+pub fn has_r2_access() -> bool {
+    if env::var_os("TALKIT_R2_PRESIGN_URL").is_some() || env::var_os("R2_ACCESS_KEY_ID").is_some() {
+        return true;
+    }
+    let h = home();
+    h.join(".config/talkit/r2.env").is_file()
+        || h.join("Library/Application Support/Talkit/r2.env").is_file()
+}
+
 pub fn show_private_models() -> bool {
-    env::var_os("TALKIT_SHOW_PRIVATE_MODELS").is_some()
+    env::var_os("TALKIT_SHOW_PRIVATE_MODELS").is_some() || has_r2_access()
 }
 
 pub fn is_model_visible(spec: &ModelSpec) -> bool {
-    spec.public_download || show_private_models()
+    spec.public_download
+        || show_private_models()
+        || matches!(scan_model(spec), ModelState::Installed { .. })
 }
 
 pub fn spec(id: &str) -> Option<&'static ModelSpec> {
