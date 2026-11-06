@@ -25,7 +25,7 @@ mod tts;
 use std::{
     borrow::Cow,
     collections::VecDeque,
-    env,
+    env, fs,
     io::{BufRead, BufReader},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -38,7 +38,7 @@ use gpui::{
     div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rgba, size, svg, App,
     Application, AssetSource, Bounds, BoxShadow, ClipboardItem, Context, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Result as GpuiResult,
-    ScrollHandle, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
     WindowOptions,
 };
 use serde::Deserialize;
@@ -92,6 +92,15 @@ impl AssetSource for EmbeddedSvgAssets {
             }
             "icons/talkit_logo.svg" => {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><rect x="1.2" y="8.8" width="3.2" height="6.4" rx="1.6"/><rect x="5.8" y="5.2" width="3.2" height="13.6" rx="1.6"/><rect x="10.4" y="2.0" width="3.2" height="20.0" rx="1.6"/><rect x="15.0" y="5.2" width="3.2" height="13.6" rx="1.6"/><rect x="19.6" y="8.8" width="3.2" height="6.4" rx="1.6"/></svg>"#
+            }
+            "icons/history.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>"#
+            }
+            "icons/arrow_down.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v15"/><path d="m6 13 6 6 6-6"/></svg>"#
+            }
+            "icons/back.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>"#
             }
             _ => return Ok(None),
         };
@@ -685,14 +694,25 @@ fn resolve_backend_script() -> PathBuf {
         .join("backend.py")
 }
 
-fn spawn_backend(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
+fn spawn_backend(
+    tx: mpsc::UnboundedSender<Event>,
+    source: SourceMode,
+    out_path: Option<&PathBuf>,
+) -> std::io::Result<Child> {
     let python = resolve_python_bin();
     let script = resolve_backend_script();
 
-    let mut child = Command::new(&python)
-        .args(["-X", "utf8"])
+    let mut cmd = Command::new(&python);
+    cmd.args(["-X", "utf8"])
         .arg(&script)
         .args(env::args().skip(1))
+        // 뒤에 붙인 값이 이긴다 (argparse 는 마지막 값을 씀)
+        .args(["--source", source.arg()]);
+    // 입력 전환으로 백엔드를 다시 띄울 때도 같은 세션 파일에 이어 쓴다
+    if let Some(p) = out_path {
+        cmd.arg("--out").arg(p);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -718,6 +738,189 @@ fn spawn_backend(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
 // ---------------------------------------------------------------------------
 // Main Mobbin-Inspired Liquid Glass & PiP View
 // ---------------------------------------------------------------------------
+
+/// 무엇을 녹음할지: 마이크 / 시스템 소리 / 둘 다
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceMode {
+    Mic,
+    System,
+    Both,
+}
+
+impl SourceMode {
+    fn all() -> [SourceMode; 3] {
+        [SourceMode::Mic, SourceMode::System, SourceMode::Both]
+    }
+    fn arg(&self) -> &'static str {
+        match self {
+            SourceMode::Mic => "mic",
+            SourceMode::System => "system",
+            SourceMode::Both => "both",
+        }
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            SourceMode::Mic => "마이크",
+            SourceMode::System => "시스템",
+            SourceMode::Both => "둘 다",
+        }
+    }
+    fn from_arg(s: &str) -> Option<Self> {
+        match s.trim() {
+            "mic" => Some(SourceMode::Mic),
+            "system" => Some(SourceMode::System),
+            "both" => Some(SourceMode::Both),
+            _ => None,
+        }
+    }
+}
+
+fn settings_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|h| {
+        PathBuf::from(h)
+            .join("Library")
+            .join("Application Support")
+            .join("Talkit")
+            .join("settings.txt")
+    })
+}
+
+fn load_source_mode() -> SourceMode {
+    // 명령줄에 --source 를 줬으면 그것을 시작값으로 쓴다
+    let args: Vec<String> = env::args().collect();
+    if let Some(m) = args
+        .windows(2)
+        .find(|w| w[0] == "--source")
+        .and_then(|w| SourceMode::from_arg(&w[1]))
+    {
+        return m;
+    }
+    settings_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("source=").and_then(SourceMode::from_arg))
+        })
+        .unwrap_or(SourceMode::Both)
+}
+
+fn save_source_mode(mode: SourceMode) {
+    if let Some(p) = settings_path() {
+        if let Some(dir) = p.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(p, format!("source={}\n", mode.arg()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 이전 녹음 기록 (transcript_YYYY-MM-DD_HHMM.txt)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Live,
+    HistoryList,
+    HistoryDetail,
+}
+
+#[derive(Clone)]
+struct HistoryEntry {
+    path: PathBuf,
+    title: SharedString,
+    lines: usize,
+    preview: SharedString,
+}
+
+#[derive(Clone)]
+struct HistoryLine {
+    clock: Option<SharedString>,
+    source: Option<SharedString>,
+    body: SharedString,
+}
+
+fn parse_history_line(line: &str) -> Option<HistoryLine> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (clock, rest) = if line.starts_with('[') {
+        match line.find("] ") {
+            Some(idx) if !matches!(&line[1..idx], "시스템" | "마이크") => {
+                (Some(SharedString::from(line[1..idx].to_string())), &line[idx + 2..])
+            }
+            _ => (None, line),
+        }
+    } else {
+        (None, line)
+    };
+    let (source, body) = parse_source_prefix(rest);
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(HistoryLine {
+        clock,
+        source,
+        body: SharedString::from(body.to_string()),
+    })
+}
+
+/// transcript_2026-11-05_1740.txt → "2026-11-05 17:40"
+fn history_title(path: &PathBuf) -> SharedString {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let core = stem.strip_prefix("transcript_").unwrap_or(stem);
+    if let Some((date, hm)) = core.split_once('_') {
+        if hm.len() == 4 && hm.chars().all(|c| c.is_ascii_digit()) {
+            return SharedString::from(format!("{} {}:{}", date, &hm[..2], &hm[2..]));
+        }
+    }
+    SharedString::from(core.to_string())
+}
+
+fn scan_history(extra_dir: Option<PathBuf>) -> Vec<HistoryEntry> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(h) = env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join("Documents").join("Talkit"));
+    }
+    if let Some(d) = extra_dir {
+        dirs.push(d);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !(name.starts_with("transcript_") && name.ends_with(".txt")) {
+                continue;
+            }
+            let key = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let content = fs::read_to_string(&path).unwrap_or_default();
+            let parsed: Vec<HistoryLine> = content.lines().filter_map(parse_history_line).collect();
+            let preview = parsed
+                .first()
+                .map(|l| {
+                    let s: String = l.body.chars().take(60).collect();
+                    SharedString::from(s)
+                })
+                .unwrap_or_else(|| "(내용 없음)".into());
+            out.push(HistoryEntry {
+                title: history_title(&path),
+                lines: parsed.len(),
+                preview,
+                path,
+            });
+        }
+    }
+    // 파일 이름이 시간순이라 이름 역순 = 최신순
+    out.sort_by(|a, b| b.path.file_name().cmp(&a.path.file_name()));
+    out
+}
 
 #[derive(Clone)]
 struct TranscriptItem {
@@ -815,6 +1018,17 @@ struct TranscriptView {
     partial_mic: SharedString,
     items: VecDeque<TranscriptItem>,
     scroll: ScrollHandle,
+    /// 전사 따라가기: 켜져 있을 때만 새 전사가 오면 맨 아래로 내려간다
+    follow_tail: bool,
+    source_mode: SourceMode,
+    /// 백엔드를 다시 띄울 때마다 증가. 이전 프로세스의 이벤트(종료 알림 등)는 무시한다
+    backend_gen: u64,
+    save_path: Option<PathBuf>,
+    view_mode: ViewMode,
+    history: Vec<HistoryEntry>,
+    history_detail: Option<(HistoryEntry, Vec<HistoryLine>)>,
+    history_copied: Option<usize>,
+    history_scroll: ScrollHandle,
     _backend: Option<Child>,
 }
 
@@ -829,7 +1043,6 @@ impl Drop for TranscriptView {
 
 impl TranscriptView {
     fn new(cx: &mut Context<Self>) -> Self {
-        let (tx, mut rx) = mpsc::unbounded();
         let mut status = VecDeque::with_capacity(MAX_STATUS_ENTRIES);
         status.push_back("MLX 4-bit (1.07GB) 실시간 스트리밍 준비 중…".into());
 
@@ -859,16 +1072,36 @@ impl TranscriptView {
             partial_mic: "".into(),
             items: VecDeque::with_capacity(MAX_TRANSCRIPT_ITEMS),
             scroll: ScrollHandle::new(),
+            follow_tail: true,
+            source_mode: load_source_mode(),
+            backend_gen: 0,
+            save_path: None,
+            view_mode: ViewMode::Live,
+            history: Vec::new(),
+            history_detail: None,
+            history_copied: None,
+            history_scroll: ScrollHandle::new(),
             _backend: None,
         };
-        match spawn_backend(tx) {
-            Ok(child) => view._backend = Some(child),
-            Err(e) => view.push_line(format!("백엔드 실행 실패: {e} (RECORDER_PYTHON 확인)"), true),
+        view.start_backend(cx);
+        view
+    }
+
+    fn start_backend(&mut self, cx: &mut Context<Self>) {
+        let (tx, mut rx) = mpsc::unbounded();
+        self.backend_gen += 1;
+        let gen = self.backend_gen;
+        match spawn_backend(tx, self.source_mode, self.save_path.as_ref()) {
+            Ok(child) => self._backend = Some(child),
+            Err(e) => self.push_line(format!("백엔드 실행 실패: {e} (RECORDER_PYTHON 확인)"), true),
         }
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.next().await {
                 let alive = this.update(cx, |view, cx| {
+                    if view.backend_gen != gen {
+                        return; // 이미 교체된 백엔드
+                    }
                     view.apply(event);
                     cx.notify();
                 });
@@ -878,7 +1111,85 @@ impl TranscriptView {
             }
         })
         .detach();
-        view
+    }
+
+    fn stop_backend(&mut self) {
+        if let Some(mut child) = self._backend.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn set_source(&mut self, mode: SourceMode, cx: &mut Context<Self>) {
+        if self.source_mode == mode {
+            return;
+        }
+        self.source_mode = mode;
+        save_source_mode(mode);
+        // 바뀐 입력으로 백엔드를 다시 띄운다 (모델을 다시 불러오므로 몇 초 걸림)
+        self.backend_gen += 1; // 이전 백엔드의 '종료됨' 알림이 오류 카드로 뜨지 않게 먼저 끊는다
+        self.stop_backend();
+        self.partial = "".into();
+        self.partial_sys = "".into();
+        self.partial_mic = "".into();
+        self.audio_level = 0.0;
+        self.push_status(format!("입력을 '{}'(으)로 바꾸는 중… 모델 다시 불러오는 중", mode.label()));
+        self.start_backend(cx);
+        cx.notify();
+    }
+
+    /// 전사 따라가기가 켜져 있을 때만 맨 아래로 내린다
+    fn autoscroll(&self) {
+        if self.follow_tail {
+            self.scroll.scroll_to_bottom();
+        }
+    }
+
+    fn toggle_follow(&mut self, cx: &mut Context<Self>) {
+        self.follow_tail = !self.follow_tail;
+        if self.follow_tail {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    fn open_history(&mut self, cx: &mut Context<Self>) {
+        let extra = self.save_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        self.history = scan_history(extra);
+        self.history_detail = None;
+        self.history_copied = None;
+        self.view_mode = ViewMode::HistoryList;
+        self.history_scroll.set_offset(point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    fn open_history_entry(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.history.get(idx).cloned() else { return };
+        let content = fs::read_to_string(&entry.path).unwrap_or_default();
+        let lines: Vec<HistoryLine> = content.lines().filter_map(parse_history_line).collect();
+        self.history_detail = Some((entry, lines));
+        self.history_copied = None;
+        self.view_mode = ViewMode::HistoryDetail;
+        self.history_scroll.set_offset(point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    fn close_history(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = ViewMode::Live;
+        self.history_detail = None;
+        if self.follow_tail {
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    fn copy_history(&mut self, idx: usize, text: String, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.history_copied = Some(idx);
+        cx.notify();
     }
 
     fn push_status(&mut self, msg: impl Into<SharedString>) {
@@ -949,7 +1260,7 @@ impl TranscriptView {
                 sentence_complete: true,
                 is_error: true,
             });
-            self.scroll.scroll_to_bottom();
+            self.autoscroll();
             return;
         }
 
@@ -1003,7 +1314,7 @@ impl TranscriptView {
                 });
             }
         }
-        self.scroll.scroll_to_bottom();
+        self.autoscroll();
     }
 
     fn full_continuous_text(&self) -> String {
@@ -1067,7 +1378,13 @@ impl TranscriptView {
 
     fn apply(&mut self, event: Event) {
         match event {
-            Event::Msg(BackendMsg::Status { msg }) => self.push_status(msg),
+            Event::Msg(BackendMsg::Status { msg }) => {
+                // 지금 세션 파일 경로를 기억해 둔다 (입력 전환 시 같은 파일에 이어 쓰기, 기록 목록 위치)
+                if let Some(p) = msg.strip_prefix("저장 파일: ") {
+                    self.save_path = Some(PathBuf::from(p.trim()));
+                }
+                self.push_status(msg)
+            }
             Event::Msg(BackendMsg::Partial { text }) => {
                 if !self.paused {
                     let (src, rest) = parse_source_prefix(&text);
@@ -1076,7 +1393,7 @@ impl TranscriptView {
                         Some("마이크") => self.partial_mic = SharedString::from(rest.to_string()),
                         _ => self.partial = SharedString::from(rest.to_string()),
                     }
-                    self.scroll.scroll_to_bottom();
+                    self.autoscroll();
                 }
             }
             Event::Msg(BackendMsg::Text {
@@ -1729,6 +2046,286 @@ impl TranscriptView {
     // -----------------------------------------------------------------------
     // 2. Full Talkit Studio Mode (Talkit Brand Identity Guide)
     // -----------------------------------------------------------------------
+    fn render_history_panel(
+        &self,
+        is_compact: bool,
+        body_font: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = self.preset.theme();
+        let current = self
+            .save_path
+            .as_ref()
+            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+
+        let small_btn = |id: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .h(px(24.0))
+                .px_2p5()
+                .rounded(px(999.0))
+                .cursor_pointer()
+                .bg(rgba(theme.pill_bg))
+                .border_1()
+                .border_color(rgba(theme.pill_border))
+                .hover(|d| d.bg(rgba(theme.pill_hover_bg)))
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(px(11.0))
+                .text_color(rgba(theme.text_primary))
+        };
+
+        let card = |id: SharedString| {
+            div()
+                .id(id)
+                .px(px(if is_compact { 12.0 } else { 16.0 }))
+                .py_2p5()
+                .rounded(px(18.0))
+                .cursor_pointer()
+                .bg(linear_gradient(
+                    180.0,
+                    linear_color_stop(rgba(theme.card_bg_top), 0.0),
+                    linear_color_stop(rgba(theme.card_bg_bottom), 1.0),
+                ))
+                .border_1()
+                .border_color(rgba(theme.card_border))
+                .hover(|d| d.bg(rgba(theme.card_hover_bg)))
+                .flex()
+                .items_start()
+                .gap(px(if is_compact { 8.0 } else { 12.0 }))
+        };
+
+        // 위쪽 제목 줄
+        let header = match (&self.view_mode, &self.history_detail) {
+            (ViewMode::HistoryDetail, Some((entry, lines))) => {
+                let all_text = lines
+                    .iter()
+                    .map(|l| match &l.source {
+                        Some(s) => format!("[{}] {}", s, l.body),
+                        None => l.body.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let all_copied = self.history_copied == Some(usize::MAX);
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_1()
+                    .child(
+                        small_btn("history-back-btn")
+                            .child(icon_svg("icons/back.svg", 11.5, theme.text_primary))
+                            .child("목록")
+                            .on_click(cx.listener(|this, _, _, cx| this.open_history(cx))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(13.0))
+                            .text_color(rgba(theme.text_primary))
+                            .child(SharedString::from(format!(
+                                "{} · {}문장",
+                                entry.title,
+                                lines.len()
+                            ))),
+                    )
+                    .child(
+                        small_btn("history-copy-all-btn")
+                            .child(icon_svg(
+                                if all_copied { "icons/check.svg" } else { "icons/copy.svg" },
+                                11.5,
+                                theme.text_primary,
+                            ))
+                            .child(if all_copied { "복사됨" } else { "전체복사" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.copy_history(usize::MAX, all_text.clone(), cx)
+                            })),
+                    )
+            }
+            _ => div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(13.0))
+                        .text_color(rgba(theme.text_primary))
+                        .child(SharedString::from(format!(
+                            "이전 녹음 {}개",
+                            self.history.len()
+                        ))),
+                )
+                .child(
+                    small_btn("history-refresh-btn")
+                        .child("새로고침")
+                        .on_click(cx.listener(|this, _, _, cx| this.open_history(cx))),
+                ),
+        };
+
+        let mut list = div()
+            .id("history-scroll")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .px_1()
+            .py_1()
+            .overflow_y_scroll()
+            .track_scroll(&self.history_scroll);
+
+        match (&self.view_mode, &self.history_detail) {
+            (ViewMode::HistoryDetail, Some((_, lines))) => {
+                if lines.is_empty() {
+                    list = list.child(
+                        div()
+                            .m_auto()
+                            .text_size(px(12.5))
+                            .text_color(rgba(theme.text_muted))
+                            .child("이 녹음에는 전사된 문장이 없습니다."),
+                    );
+                }
+                list = list.children(lines.iter().enumerate().map(|(i, line)| {
+                    let is_mic = line.source.as_ref().map(|s| s.as_ref()) == Some("마이크");
+                    let accent = if is_mic { 0x10b981ff } else { TALKIT_BLUE };
+                    let copied = self.history_copied == Some(i);
+                    let text = line.body.to_string();
+                    let label = SharedString::from(match (&line.source, &line.clock) {
+                        (Some(s), Some(c)) if !is_compact => format!("{} {}", s, c),
+                        (Some(s), _) => s.to_string(),
+                        (None, Some(c)) => c.to_string(),
+                        (None, None) => "문장".to_string(),
+                    });
+                    card(SharedString::from(format!("history-line-{}", i)))
+                        .when(copied, |d| d.border_color(rgba(TALKIT_BLUE)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_history(i, text.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(3.0))
+                                .w(px(3.5))
+                                .h(px(20.0))
+                                .rounded(px(999.0))
+                                .bg(rgba(accent)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .mt(px(1.0))
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded(px(999.0))
+                                .bg(rgba(theme.pill_bg))
+                                .border_1()
+                                .border_color(rgba(theme.pill_border))
+                                .text_size(px(11.0))
+                                .text_color(rgba(accent))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(px(body_font))
+                                .text_color(rgba(theme.text_primary))
+                                .child(line.body.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(rgba(if copied { TALKIT_BLUE } else { theme.text_muted }))
+                                .child(if copied { "복사됨" } else { "" }),
+                        )
+                }));
+            }
+            _ => {
+                if self.history.is_empty() {
+                    list = list.child(
+                        div()
+                            .m_auto()
+                            .text_size(px(12.5))
+                            .text_color(rgba(theme.text_muted))
+                            .child("아직 저장된 녹음이 없습니다. (~/Documents/Talkit)"),
+                    );
+                }
+                list = list.children(self.history.iter().enumerate().map(|(i, entry)| {
+                    let is_current = current.as_ref().map_or(false, |c| {
+                        fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone()) == *c
+                    });
+                    card(SharedString::from(format!("history-entry-{}", i)))
+                        .items_center()
+                        .on_click(cx.listener(move |this, _, _, cx| this.open_history_entry(i, cx)))
+                        .child(icon_svg("icons/history.svg", 15.0, TALKIT_BLUE))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_size(px(14.0))
+                                                .text_color(rgba(theme.text_primary))
+                                                .child(entry.title.clone()),
+                                        )
+                                        .when(is_current, |d| {
+                                            d.child(
+                                                div()
+                                                    .px_1p5()
+                                                    .rounded(px(999.0))
+                                                    .bg(rgba(TALKIT_BLUE))
+                                                    .text_size(px(10.0))
+                                                    .text_color(rgba(0xffffffff))
+                                                    .child("지금 녹음 중"),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(rgba(theme.text_muted))
+                                        .child(entry.preview.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(rgba(theme.text_secondary))
+                                .child(SharedString::from(format!("{}문장", entry.lines))),
+                        )
+                }));
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .child(header)
+            .child(list)
+    }
+
     fn render_studio_mode(&self, vw: f32, vh: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.preset.theme();
         let is_compact = vw < 680.0;
@@ -1960,6 +2557,52 @@ impl TranscriptView {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
+                                    .child({
+                                        let in_history = self.view_mode != ViewMode::Live;
+                                        div()
+                                            .id("history-btn")
+                                            .flex_none()
+                                            .h(px(30.0))
+                                            .px_3()
+                                            .rounded(px(999.0))
+                                            .cursor_pointer()
+                                            .bg(rgba(if in_history { 0x4f6bff24 } else { theme.pill_bg }))
+                                            .border_1()
+                                            .border_color(rgba(if in_history {
+                                                TALKIT_BLUE
+                                            } else {
+                                                theme.pill_border
+                                            }))
+                                            .hover(|d| d.bg(rgba(theme.pill_hover_bg)))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_size(px(11.5))
+                                            .text_color(rgba(if in_history {
+                                                TALKIT_BLUE
+                                            } else {
+                                                theme.text_primary
+                                            }))
+                                            .child(icon_svg(
+                                                if in_history { "icons/back.svg" } else { "icons/history.svg" },
+                                                13.0,
+                                                if in_history { TALKIT_BLUE } else { theme.text_primary },
+                                            ))
+                                            .child(if in_history {
+                                                if is_compact { "실시간" } else { "실시간으로" }
+                                            } else if is_compact {
+                                                "기록"
+                                            } else {
+                                                "녹음 기록"
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if in_history {
+                                                    this.close_history(cx);
+                                                } else {
+                                                    this.open_history(cx);
+                                                }
+                                            }))
+                                    })
                                     .child(
                                         div()
                                             .id("pip-mode-btn")
@@ -2074,6 +2717,100 @@ impl TranscriptView {
                                     .flex_wrap()
                                     .items_center()
                                     .gap_1()
+                                    // 녹음 입력 선택: 마이크 / 시스템 / 둘 다
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .p(px(2.0))
+                                            .gap(px(2.0))
+                                            .rounded(px(999.0))
+                                            .bg(rgba(theme.pill_bg))
+                                            .border_1()
+                                            .border_color(rgba(theme.pill_border))
+                                            .children(SourceMode::all().into_iter().map(|m| {
+                                                let active = self.source_mode == m;
+                                                div()
+                                                    .id(SharedString::from(format!("source-{}", m.arg())))
+                                                    .flex_none()
+                                                    .h(px(20.0))
+                                                    .px_2()
+                                                    .rounded(px(999.0))
+                                                    .cursor_pointer()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .text_size(px(11.0))
+                                                    .bg(rgba(if active { TALKIT_BLUE } else { 0x00000000 }))
+                                                    .text_color(rgba(if active {
+                                                        0xffffffff
+                                                    } else {
+                                                        theme.text_secondary
+                                                    }))
+                                                    .when(!active, |d| d.hover(|d| d.bg(rgba(theme.pill_hover_bg))))
+                                                    .when(m == SourceMode::Mic, |d| {
+                                                        d.child(icon_svg(
+                                                            "icons/mic.svg",
+                                                            10.5,
+                                                            if active { 0xffffffff } else { theme.text_secondary },
+                                                        ))
+                                                    })
+                                                    .child(m.label())
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.set_source(m, cx);
+                                                    }))
+                                            })),
+                                    )
+                                    // 전사 따라가기 토글
+                                    .child(
+                                        div()
+                                            .id("follow-tail-btn")
+                                            .flex_none()
+                                            .h(px(24.0))
+                                            .px_2p5()
+                                            .rounded(px(999.0))
+                                            .cursor_pointer()
+                                            .bg(rgba(if self.follow_tail { TALKIT_BLUE } else { theme.pill_bg }))
+                                            .border_1()
+                                            .border_color(rgba(if self.follow_tail {
+                                                TALKIT_BLUE
+                                            } else {
+                                                theme.pill_border
+                                            }))
+                                            .when(!self.follow_tail, |d| d.hover(|d| d.bg(rgba(theme.pill_hover_bg))))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .text_size(px(11.0))
+                                            .text_color(rgba(if self.follow_tail {
+                                                0xffffffff
+                                            } else {
+                                                theme.text_primary
+                                            }))
+                                            .child(icon_svg(
+                                                "icons/arrow_down.svg",
+                                                11.0,
+                                                if self.follow_tail { 0xffffffff } else { theme.text_primary },
+                                            ))
+                                            .child(if is_compact {
+                                                "따라가기"
+                                            } else if self.follow_tail {
+                                                "전사 따라가기 켬"
+                                            } else {
+                                                "전사 따라가기 끔"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_follow(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(1.0))
+                                            .h(px(14.0))
+                                            .mx_1()
+                                            .bg(rgba(theme.pill_border)),
+                                    )
                                     .children(
                                         GlassPreset::all()
                                             .into_iter()
@@ -2194,7 +2931,9 @@ impl TranscriptView {
                             ),
                     )
                     // 3. Scrollable Transcript Feed (Brand Concept Card when empty + Drag-to-Select Cards)
-                    .child(
+                    .child(if self.view_mode != ViewMode::Live {
+                        self.render_history_panel(is_compact, body_font, cx).into_any_element()
+                    } else {
                         div()
                             .id("transcript")
                             .flex()
@@ -2206,6 +2945,13 @@ impl TranscriptView {
                             .py_1()
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll)
+                            // 위로 스크롤하면 따라가기를 끈다 (읽는 중에 끌려 내려가지 않게)
+                            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                                if this.follow_tail && ev.delta.pixel_delta(px(16.0)).y > px(0.0) {
+                                    this.follow_tail = false;
+                                    cx.notify();
+                                }
+                            }))
                             .when(self.items.is_empty() && !has_partial, |d| {
                                 // Matches the "Brand Concept: Talk it, Get it. / 말하는 순간, 바로 텍스트로." card in the Guide
                                 d.child(
@@ -2583,8 +3329,9 @@ impl TranscriptView {
                                                 }),
                                         )
                                 },
-                            )),
-                    )
+                            ))
+                            .into_any_element()
+                    })
                     // 4. Inset Live Streaming Subtitle Bar (Talkit Brand Pill)
                     .child({
                         let tail_caption = self.continuous_tail(92);

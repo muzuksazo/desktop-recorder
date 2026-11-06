@@ -17,6 +17,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 
@@ -518,7 +519,7 @@ class Transcriber(threading.Thread):
                 q = queue.Queue(maxsize=64)
                 ScreenCaptureKitRecorder(tap_bin, q, self.stop_event, "시스템").start()
                 queues.append(["시스템", q])
-                self.ui_q.put(("status_add", "시스템: ScreenCaptureKit (내장 루프백)"))
+                self.ui_q.put(("status_add", "시스템: macOS 시스템 오디오 탭"))
             else:
                 if sys_dev is None:
                     sys_dev = find_system_audio_device(None)
@@ -548,9 +549,61 @@ class Transcriber(threading.Thread):
         else:
             self._run_chunk_loop(model, queues, out_path, args)
 
+    # ---- 시스템 소리 권한이 없을 때: 백엔드를 끄지 않고 안내 한 번 + 조용히 재시도 ----
+    SYSTEM_RETRY_SEC = 10.0
+
+    def _on_system_channel_failed(self, err: str):
+        self._sys_last_fail = time.time()
+        if getattr(self, "_sys_fail_reported", False):
+            return  # 같은 안내를 반복하지 않는다
+        self._sys_fail_reported = True
+        denied = "TCC" in err or "거절" in err or "declined" in err.lower()
+        if denied:
+            mic_note = (
+                " 그동안 스피커 소리는 마이크로 잡혀 '마이크'로 표시될 수 있어요."
+                if self.args.source == "both" else ""
+            )
+            self.ui_q.put((
+                "error",
+                "[시스템] 시스템 소리 녹음 권한이 꺼져 있어요. 방금 연 설정 화면 아래쪽 '시스템 오디오 녹음만'에서 "
+                "Talkit 을 켜 주세요. 켜면 10초 안에 자동으로 다시 연결합니다." + mic_note,
+            ))
+            if platform.system() == "Darwin" and not os.environ.get("TALKIT_NO_OPEN_SETTINGS"):
+                try:
+                    import subprocess
+                    subprocess.Popen(
+                        ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+        else:
+            self.ui_q.put(("error", f"[시스템] 시스템 소리를 받을 수 없습니다: {err} (10초마다 다시 시도합니다)"))
+
+    def _maybe_revive_system(self, queues):
+        """시스템 채널이 빠져 있으면 10초마다 조용히 다시 연결해 본다 (권한을 켜면 저절로 붙음)."""
+        if self.args.source not in ("system", "both"):
+            return
+        if any(lbl == "시스템" for lbl, _ in queues):
+            return
+        if time.time() - getattr(self, "_sys_last_fail", 0.0) < self.SYSTEM_RETRY_SEC:
+            return
+        tap_bin = find_macos_audio_tap_binary()
+        if tap_bin is None:
+            return
+        self._sys_last_fail = time.time()
+        q = queue.Queue(maxsize=64)
+        ScreenCaptureKitRecorder(tap_bin, q, self.stop_event, "시스템").start()
+        queues.append(["시스템", q])
+        if getattr(self, "_sys_fail_reported", False):
+            self.ui_q.put(("status", "시스템 소리 다시 연결 시도 중…"))
+
     def _read_channel_blocks(self, queues):
+        self._maybe_revive_system(queues)
         if not queues:
-            return None
+            # 살아 있는 입력이 없어도 끝내지 않고 기다린다 (권한을 켜면 다시 붙는다)
+            time.sleep(0.25)
+            return {}
         blocks = {}
         dead_indices = []
         for idx, (label, q) in enumerate(queues):
@@ -559,7 +612,10 @@ class Transcriber(threading.Thread):
             except queue.Empty:
                 continue
             if isinstance(item, Exception):
-                self.ui_q.put(("error", str(item)))
+                if label == "시스템":
+                    self._on_system_channel_failed(str(item))
+                else:
+                    self.ui_q.put(("error", str(item)))
                 dead_indices.append(idx)
                 continue
             blocks[label] = item
@@ -567,8 +623,7 @@ class Transcriber(threading.Thread):
         for idx in reversed(dead_indices):
             queues.pop(idx)
 
-        if not queues:
-            return None
+        # 입력이 모두 빠져도 None(종료)을 돌려주지 않는다 — 다음 호출에서 다시 연결을 시도
         return blocks
 
     def _commit_text(
