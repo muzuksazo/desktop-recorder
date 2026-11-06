@@ -648,6 +648,17 @@ enum BackendMsg {
         rms: f32,
         mem_mb: f32,
     },
+    /// 이 Mac 에서 쓸 수 있는 모델 목록과 지금 쓰는 모델 (백엔드가 시작할 때 보냄)
+    Models {
+        items: Vec<ModelItem>,
+        current: String,
+    },
+}
+
+#[derive(Deserialize, Clone)]
+struct ModelItem {
+    id: String,
+    label: String,
 }
 
 enum Event {
@@ -664,7 +675,14 @@ fn resolve_python_bin() -> PathBuf {
     if let Some(p) = env::var_os("RECORDER_PYTHON") {
         return PathBuf::from(p);
     }
-    if let Some(home) = env::var_os("HOME") {
+    // 외부 배포판(Resources/edition.txt = public)은 비공개 엔진 애드온을 쓰지 않는다
+    let public_edition = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("../Resources/edition.txt")))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim() == "public")
+        .unwrap_or(false);
+    if let (false, Some(home)) = (public_edition, env::var_os("HOME")) {
         let home = PathBuf::from(home);
         let addon_dirs = [
             home.join("Library/Application Support/Talkit/engines/rung-omega"),
@@ -723,6 +741,7 @@ fn resolve_backend_script() -> PathBuf {
 fn spawn_backend(
     tx: mpsc::UnboundedSender<Event>,
     source: SourceMode,
+    model_choice: &str,
     out_path: Option<&PathBuf>,
 ) -> std::io::Result<Child> {
     let python = resolve_python_bin();
@@ -737,6 +756,10 @@ fn spawn_backend(
     // 입력 전환으로 백엔드를 다시 띄울 때도 같은 세션 파일에 이어 쓴다
     if let Some(p) = out_path {
         cmd.arg("--out").arg(p);
+    }
+    // 설정에서 고른 모델 (비어 있으면 백엔드가 그 Mac 에 맞는 기본값을 고른다)
+    if !model_choice.is_empty() {
+        cmd.args(["--model-choice", model_choice]);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -821,22 +844,38 @@ fn load_source_mode() -> SourceMode {
     {
         return m;
     }
-    settings_path()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("source=").and_then(SourceMode::from_arg))
-        })
+    read_setting("source")
+        .and_then(|v| SourceMode::from_arg(&v))
         .unwrap_or(SourceMode::Both)
 }
 
 fn save_source_mode(mode: SourceMode) {
-    if let Some(p) = settings_path() {
-        if let Some(dir) = p.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        let _ = fs::write(p, format!("source={}\n", mode.arg()));
+    write_setting("source", mode.arg());
+}
+
+/// settings.txt 의 key=value 한 줄을 읽는다
+fn read_setting(key: &str) -> Option<String> {
+    let text = fs::read_to_string(settings_path()?).ok()?;
+    let prefix = format!("{key}=");
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()).map(|v| v.trim().to_string()))
+}
+
+/// 다른 설정은 그대로 두고 key 한 줄만 바꾼다
+fn write_setting(key: &str, value: &str) {
+    let Some(p) = settings_path() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
     }
+    let prefix = format!("{key}=");
+    let mut lines: Vec<String> = fs::read_to_string(&p)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with(prefix.as_str()) && !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("{key}={value}"));
+    let _ = fs::write(p, lines.join("\n") + "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1086,9 @@ struct TranscriptView {
     /// 전사 따라가기: 켜져 있을 때만 새 전사가 오면 맨 아래로 내려간다
     follow_tail: bool,
     source_mode: SourceMode,
+    /// 이 Mac 에서 쓸 수 있는 모델들 (백엔드가 알려 줌) 과 고른 모델 id
+    models: Vec<ModelItem>,
+    model_choice: String,
     /// 백엔드를 다시 띄울 때마다 증가. 이전 프로세스의 이벤트(종료 알림 등)는 무시한다
     backend_gen: u64,
     save_path: Option<PathBuf>,
@@ -1100,6 +1142,8 @@ impl TranscriptView {
             scroll: ScrollHandle::new(),
             follow_tail: true,
             source_mode: load_source_mode(),
+            models: Vec::new(),
+            model_choice: read_setting("model").unwrap_or_default(),
             backend_gen: 0,
             save_path: None,
             view_mode: ViewMode::Live,
@@ -1117,7 +1161,7 @@ impl TranscriptView {
         let (tx, mut rx) = mpsc::unbounded();
         self.backend_gen += 1;
         let gen = self.backend_gen;
-        match spawn_backend(tx, self.source_mode, self.save_path.as_ref()) {
+        match spawn_backend(tx, self.source_mode, &self.model_choice, self.save_path.as_ref()) {
             Ok(child) => self._backend = Some(child),
             Err(e) => self.push_line(format!("백엔드 실행 실패: {e} (RECORDER_PYTHON 확인)"), true),
         }
@@ -1152,14 +1196,33 @@ impl TranscriptView {
         }
         self.source_mode = mode;
         save_source_mode(mode);
-        // 바뀐 입력으로 백엔드를 다시 띄운다 (모델을 다시 불러오므로 몇 초 걸림)
+        self.restart_backend(format!("입력을 '{}'(으)로 바꾸는 중… 모델 다시 불러오는 중", mode.label()), cx);
+    }
+
+    fn set_model(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.model_choice == id {
+            return;
+        }
+        let label = self
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| m.label.clone())
+            .unwrap_or_else(|| id.clone());
+        self.model_choice = id;
+        write_setting("model", &self.model_choice);
+        self.restart_backend(format!("모델을 '{label}'(으)로 바꾸는 중… 불러오는 중"), cx);
+    }
+
+    /// 바뀐 설정으로 백엔드를 다시 띄운다 (모델을 다시 불러오므로 몇 초 걸림)
+    fn restart_backend(&mut self, status: String, cx: &mut Context<Self>) {
         self.backend_gen += 1; // 이전 백엔드의 '종료됨' 알림이 오류 카드로 뜨지 않게 먼저 끊는다
         self.stop_backend();
         self.partial = "".into();
         self.partial_sys = "".into();
         self.partial_mic = "".into();
         self.audio_level = 0.0;
-        self.push_status(format!("입력을 '{}'(으)로 바꾸는 중… 모델 다시 불러오는 중", mode.label()));
+        self.push_status(status);
         self.start_backend(cx);
         cx.notify();
     }
@@ -1463,6 +1526,10 @@ impl TranscriptView {
                 if !self.paused {
                     self.push_wave(rms);
                 }
+            }
+            Event::Msg(BackendMsg::Models { items, current }) => {
+                self.models = items;
+                self.model_choice = current; // 실제로 올라간 모델로 맞춘다 (없는 모델을 골랐던 경우 대비)
             }
             Event::Msg(BackendMsg::Telemetry { rms, mem_mb }) => {
                 if !self.paused {
@@ -2788,6 +2855,47 @@ impl TranscriptView {
                                                     }))
                                             })),
                                     )
+                                    // 모델 선택: 이 Mac 에 있는 모델이 둘 이상일 때만 보인다
+                                    // (다른 Mac 에는 공개 '기본 모델' 하나뿐이라 숨겨진다)
+                                    .when(self.models.len() > 1, |d| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .flex()
+                                                .items_center()
+                                                .p(px(2.0))
+                                                .gap(px(2.0))
+                                                .rounded(px(999.0))
+                                                .bg(rgba(theme.pill_bg))
+                                                .border_1()
+                                                .border_color(rgba(theme.pill_border))
+                                                .children(self.models.iter().map(|m| {
+                                                    let active = self.model_choice == m.id;
+                                                    let id = m.id.clone();
+                                                    div()
+                                                        .id(SharedString::from(format!("model-{}", m.id)))
+                                                        .flex_none()
+                                                        .h(px(20.0))
+                                                        .px_2()
+                                                        .rounded(px(999.0))
+                                                        .cursor_pointer()
+                                                        .flex()
+                                                        .items_center()
+                                                        .text_size(px(11.0))
+                                                        .bg(rgba(if active { TALKIT_BLUE } else { 0x00000000 }))
+                                                        .text_color(rgba(if active {
+                                                            0xffffffff
+                                                        } else {
+                                                            theme.text_secondary
+                                                        }))
+                                                        .when(!active, |d| d.hover(|d| d.bg(rgba(theme.pill_hover_bg))))
+                                                        .child(SharedString::from(m.label.clone()))
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.set_model(id.clone(), cx);
+                                                        }))
+                                                })),
+                                        )
+                                    })
                                     // 전사 따라가기 토글
                                     .child(
                                         div()

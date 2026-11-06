@@ -230,37 +230,90 @@ def private_engine_dirs():
     return dirs
 
 
-def _install_private_engine(lt, emit):
-    """Rung Ω 같은 비공개 엔진 애드온이 있으면 모델 로더를 그것으로 바꾼다. 없거나 실패하면 공개 4-bit 모델.
+def is_public_edition():
+    """외부 배포판이면 True. 패키징 스크립트가 앱 안에 edition.txt(public)를 넣는다.
+    배포판은 그 Mac 에 비공개 엔진 폴더가 있어도 쓰지 않고 공개 4-bit 모델만 쓴다."""
+    from pathlib import Path
 
-    애드온 폴더에는 qwen3_asr_rung_omega_mac.py 와 artifacts/ 가 있다. 이 엔진은 torch 가 필요해서,
-    앱(Talkit.app)은 애드온 폴더의 python-path.txt 에 적힌 Python 으로 백엔드를 띄운다(main.rs).
-    """
-    import sys
+    f = Path(__file__).resolve().parent / "edition.txt"
+    try:
+        return f.read_text(encoding="utf-8").strip() == "public"
+    except OSError:
+        return False
 
+
+def _find_private_root():
+    if is_public_edition():
+        return None
     for root in private_engine_dirs():
-        if not (root / "qwen3_asr_rung_omega_mac.py").is_file():
-            continue
-        try:
-            if str(root) not in sys.path:
-                sys.path.insert(0, str(root))
-            import mlx.core as mx
-            from qwen3_asr_rung_omega_mac import MacTheoremFlowOmegaASREngine, MLX_OMEGA_DIR
+        if (root / "qwen3_asr_rung_omega_mac.py").is_file() and (root / "artifacts").is_dir():
+            return root
+    return None
 
-            g128 = MLX_OMEGA_DIR.parent / "qwen3_asr_1_7b_ko_rung_omega_g128_mlx"
 
-            def _load_private(device_arg, model_id, mlx_4bit=True):
-                mx.set_cache_limit(128 * 1024 * 1024)
-                engine = MacTheoremFlowOmegaASREngine.from_omega_dir(g128 if g128.exists() else MLX_OMEGA_DIR)
-                tag = "mlx-rung-omega-4trit+FA" if engine.forced_aligner is not None else "mlx-rung-omega"
-                return engine, tag
+# 고를 수 있는 모델: (id, 화면 이름, artifacts 아래 폴더, 문장 맞추기(FA) 사용)
+_PRIVATE_VARIANTS = [
+    ("rung-omega", "Rung Ω", "qwen3_asr_1_7b_ko_rung_omega_g128_mlx", False),
+    ("rung-omega-fa", "Rung Ω + 문장 맞추기", "qwen3_asr_1_7b_ko_rung_omega_g128_mlx", True),
+    ("rung-omega-lite", "Rung Ω 가벼운판", "qwen3_asr_1_7b_ko_rung_omega_mac_mlx", False),
+]
+_FA_DIR = "qwen3_forced_aligner_0_6b_rung_omega_mac_mlx"
 
-            lt.load_model = _load_private
-            sys.stderr.write(f"[Talkit] 비공개 엔진 사용: {root}\n")
-            return
-        except Exception as e:  # 애드온이 깨져도 앱은 공개 모델로 계속 동작
-            sys.stderr.write(f"[Talkit] 비공개 엔진을 쓸 수 없어 공개 4-bit 모델 사용: {e}\n")
-            return
+
+def list_models():
+    """이 Mac 에서 쓸 수 있는 모델 목록. 공개 모델은 늘 있고, 비공개 애드온이 있으면 Rung Ω 가 추가된다."""
+    items = [{"id": "public", "label": "기본 모델"}]
+    root = _find_private_root()
+    if root is not None:
+        art = root / "artifacts"
+        for mid, label, sub, fa in _PRIVATE_VARIANTS:
+            if not (art / sub / "model.safetensors").exists():
+                continue
+            if fa and not (art / _FA_DIR / "model.safetensors").exists():
+                continue
+            items.append({"id": mid, "label": label})
+    return items, root
+
+
+def default_model_choice(items):
+    ids = [i["id"] for i in items]
+    # 비공개 엔진이 있으면 Rung Ω(문장 맞추기 없이: 결과는 같고 메모리 0.9GB 절약, 2026-11-06 측정)
+    return "rung-omega" if "rung-omega" in ids else "public"
+
+
+def _install_private_engine(lt, choice, root):
+    """고른 Rung Ω 판으로 모델 로더를 바꾼다. 실패하면 공개 모델로 계속 동작."""
+    import sys
+    from pathlib import Path
+
+    variant = next((v for v in _PRIVATE_VARIANTS if v[0] == choice), None)
+    if variant is None or root is None:
+        return False
+    _, label, sub, use_fa = variant
+    try:
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        import mlx.core as mx
+        import qwen3_asr_rung_omega_mac as omega
+
+        model_dir = root / "artifacts" / sub
+        if not use_fa:
+            # FA 폴더를 못 찾게 해서 문장 맞추기 모델(0.9GB)을 아예 올리지 않는다
+            omega.FA_OMEGA_DIR = Path("/nonexistent-talkit-fa")
+
+        def _load_private(device_arg, model_id, mlx_4bit=True):
+            mx.set_cache_limit(128 * 1024 * 1024)
+            engine = omega.MacTheoremFlowOmegaASREngine.from_omega_dir(model_dir)
+            # 이 이름은 live_transcribe 가 'mlx' 로 시작하는지로 실시간 스트리밍 방식을 고르는 데 쓴다.
+            # 화면용 이름(label)을 넣으면 옛 덩어리 방식으로 빠져 '.transcribe 없음' 오류가 난다(2026-11-06).
+            return engine, f"mlx-{choice}"
+
+        lt.load_model = _load_private
+        sys.stderr.write(f"[Talkit] 비공개 엔진 사용: {label} ({model_dir})\n")
+        return True
+    except Exception as e:  # 애드온이 깨져도 앱은 공개 모델로 계속 동작
+        sys.stderr.write(f"[Talkit] 비공개 엔진을 쓸 수 없어 기본 모델 사용: {e}\n")
+        return False
 
 
 def main():
@@ -269,11 +322,10 @@ def main():
 
     import live_transcribe as lt
 
-    _install_private_engine(lt, emit)
-
     p = argparse.ArgumentParser(description="전사 백엔드 (GPUI 앱용, 화면 없음)")
     p.add_argument("--model", default=lt.MODEL_ID, help="모델 폴더 경로 또는 HF 모델 ID")
     p.add_argument("--source", choices=["both", "mic", "system"], default="both")
+    p.add_argument("--model-choice", default="", help="쓸 모델 id (public / rung-omega / rung-omega-fa / rung-omega-lite)")
     p.add_argument("--chunk", type=float, default=6.0, help="최대 발화 구간 길이(초, 기본 6)")
     p.add_argument("--device", default="auto", help="auto / mlx / cuda:0 / mps / cpu")
     p.add_argument("--system-device", default=None, help="시스템 소리 장치 이름(일부만 써도 됨)")
@@ -288,6 +340,14 @@ def main():
     p.add_argument("--input-wav", nargs="+", default=None,
                    help="테스트용: 녹음 대신 이 wav 들(16kHz mono)을 실시간 속도로 흘려 넣는다")
     args, _ = p.parse_known_args()
+
+    # 쓸 수 있는 모델을 앱에 알려 주고, 고른 모델을 준비한다
+    models, private_root = list_models()
+    ids = [m["id"] for m in models]
+    choice = args.model_choice if args.model_choice in ids else default_model_choice(models)
+    if choice != "public" and not _install_private_engine(lt, choice, private_root):
+        choice = "public"
+    emit(type="models", items=models, current=choice)
     args.language = args.language or None
 
     if args.out is None:

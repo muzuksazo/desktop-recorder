@@ -8,9 +8,8 @@
 #        VERSION=1.2.1 BUILD=7 packaging/package_macos.sh
 #        SIGN_ID="-" packaging/package_macos.sh      (서명 인증서 없이 ad-hoc)
 #
-# 비공개 Rung Ω 엔진은 여기서 넣지 않는다. 그 엔진이 있는 Mac 에서는 애드온 폴더
-# (~/Library/Application Support/Talkit/engines/rung-omega 또는 ~/qwen3-asr-ko/private_rung_omega_mac)
-# 의 python-path.txt 가 가리키는 Python 으로 앱이 백엔드를 띄운다(app/src/main.rs).
+# 외부 배포판은 공개 4-bit 모델만 쓴다(edition.txt = public). 비공개 Rung Ω 엔진은 넣지도, 찾지도 않는다.
+# Rung Ω 는 소스에서 실행하는 개발용 앱에서만 쓸 수 있다(애드온 폴더 + python-path.txt).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,6 +41,8 @@ echo "▶ 시스템 오디오 도우미 빌드"
 swiftc -O -parse-as-library "$ROOT/macos_audio_tap.swift" -o "$C/Resources/macos_audio_tap"
 
 cp "$ROOT/backend.py" "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$C/Resources/"
+# 외부 배포판 표시: 공개 4-bit 모델만 쓴다 (비공개 Rung Ω 애드온이 있는 Mac 이어도 무시)
+echo "public" > "$C/Resources/edition.txt"
 cp "$ROOT/packaging/AppIcon.icns" "$C/Resources/AppIcon.icns"
 
 echo "▶ Python $PY_VER 넣기"
