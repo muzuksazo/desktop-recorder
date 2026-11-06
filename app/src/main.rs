@@ -1201,19 +1201,14 @@ impl TranscriptView {
         let sys_info = updates::detect_system();
         let model_states = scan_all_models();
         let saved_model = read_setting("model").unwrap_or_default();
-        let model_choice = if !saved_model.is_empty() {
+        let saved_visible = !saved_model.is_empty()
+            && updates::required_models(&saved_model)
+                .iter()
+                .all(|id| updates::spec(id).is_some_and(updates::is_model_visible));
+        let model_choice = if saved_visible {
             saved_model
         } else {
-            // 처음 실행: 이미 받아 둔 모델이 있으면 바로 쓰고, 하나도 없으면 이 Mac 사양 추천 조합을 고른다
-            let rec = sys_info.recommended_choice();
-            let any_installed = ["rung-omega-fa", "rung-omega", "rung-omega-lite", "public"]
-                .into_iter()
-                .find(|c| {
-                    updates::required_models(c)
-                        .iter()
-                        .all(|id| matches!(model_states.get(id), Some(ModelState::Installed { .. })))
-                });
-            any_installed.unwrap_or(rec).to_string()
+            sys_info.recommended_choice().to_string()
         };
 
         let mut view = Self {
@@ -2929,7 +2924,12 @@ impl TranscriptView {
             .overflow_y_scroll()
             .child(header)
             .child(rec_banner)
-            .children(updates::MODELS.iter().map(|spec| self.render_model_card(spec, is_compact, cx)))
+            .children(
+                updates::MODELS
+                    .iter()
+                    .filter(|spec| updates::is_model_visible(spec))
+                    .map(|spec| self.render_model_card(spec, is_compact, cx)),
+            )
             .child(
                 div()
                     .px_1()

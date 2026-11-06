@@ -36,6 +36,8 @@ pub struct ModelSpec {
     pub label: &'static str,
     pub desc: &'static str,
     pub approx: &'static str,
+    /// Hugging Face 에서 로그인·토큰 없이 바로 받을 수 있는 공개 모델인지
+    pub public_download: bool,
     /// 개발용 Mac 의 예전 작업 폴더 이름 (외부 배포판은 보지 않음)
     dev_dir: Option<&'static str>,
 }
@@ -47,6 +49,7 @@ pub const MODELS: [ModelSpec; 4] = [
         label: "기본 모델",
         desc: "Qwen3-ASR 1.7B 한국어 · 4-bit · 가장 가볍고 빠름",
         approx: "1.1GB",
+        public_download: true,
         dev_dir: None,
     },
     ModelSpec {
@@ -55,6 +58,7 @@ pub const MODELS: [ModelSpec; 4] = [
         label: "Rung Ω",
         desc: "정확도 우선 · 한국어 전용 출력층으로 빠르게",
         approx: "2.5GB",
+        public_download: false,
         dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_g128_mlx"),
     },
     ModelSpec {
@@ -63,6 +67,7 @@ pub const MODELS: [ModelSpec; 4] = [
         label: "Rung Ω 가벼운판",
         desc: "Rung Ω 4-bit · 메모리를 적게 씀",
         approx: "1.6GB",
+        public_download: false,
         dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_mac_mlx"),
     },
     ModelSpec {
@@ -71,9 +76,18 @@ pub const MODELS: [ModelSpec; 4] = [
         label: "문장 맞추기 (Forced Aligner)",
         desc: "Rung Ω 와 함께 켜면 단어 시각을 맞춰 문장 끝 잘림·유령 단어를 줄임",
         approx: "0.97GB",
+        public_download: false,
         dev_dir: Some("qwen3_forced_aligner_0_6b_rung_omega_mac_mlx"),
     },
 ];
+
+pub fn show_private_models() -> bool {
+    env::var_os("TALKIT_SHOW_PRIVATE_MODELS").is_some()
+}
+
+pub fn is_model_visible(spec: &ModelSpec) -> bool {
+    spec.public_download || show_private_models()
+}
 
 pub fn spec(id: &str) -> Option<&'static ModelSpec> {
     MODELS.iter().find(|m| m.id == id)
@@ -100,8 +114,15 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
-    /// 메모리에 따라 가장 알맞은 CHOICES 항목 id
+    /// 메모리에 따라 가장 알맞은 CHOICES 항목 id (비공개 모델이 숨겨진 상태면 기본 모델)
     pub fn recommended_choice(&self) -> &'static str {
+        if !show_private_models() {
+            return "public";
+        }
+        self.recommended_choice_for_ram()
+    }
+
+    pub fn recommended_choice_for_ram(&self) -> &'static str {
         if self.ram_gb <= 8 {
             "public"
         } else if self.ram_gb <= 18 {
@@ -113,6 +134,13 @@ impl SystemInfo {
 
     /// 모델 카드에 '이 Mac 추천' 배지를 붙일 모델 id 들
     pub fn recommended_models(&self) -> &'static [&'static str] {
+        if !show_private_models() {
+            return &["public"];
+        }
+        self.recommended_models_for_ram()
+    }
+
+    pub fn recommended_models_for_ram(&self) -> &'static [&'static str] {
         if self.ram_gb <= 8 {
             &["public"]
         } else if self.ram_gb <= 18 {
@@ -128,6 +156,12 @@ impl SystemInfo {
 
     /// 모델 화면 맨 위에 보여 줄 한 줄 안내
     pub fn summary_line(&self) -> String {
+        if !show_private_models() {
+            return format!(
+                "이 Mac ({} · {}GB) → '기본 모델(1.1GB · MLX 4-bit)'을 추천해요",
+                self.chip, self.ram_gb
+            );
+        }
         if self.ram_gb <= 8 {
             format!(
                 "이 Mac ({} · {}GB) → 가볍고 빠른 '기본 모델(1.1GB)'을 추천해요",
@@ -648,21 +682,19 @@ mod tests {
     #[test]
     fn system_recommendations() {
         let m8 = SystemInfo { chip: "Apple M1".into(), ram_gb: 8 };
-        assert_eq!(m8.recommended_choice(), "public");
-        assert!(m8.is_recommended("public"));
-        assert!(!m8.is_recommended("rung-omega"));
+        assert_eq!(m8.recommended_choice_for_ram(), "public");
+        assert_eq!(m8.recommended_models_for_ram(), &["public"]);
         assert!(m8.memory_warning("rung-omega").is_some());
 
         let m16 = SystemInfo { chip: "Apple M1 Pro".into(), ram_gb: 16 };
-        assert_eq!(m16.recommended_choice(), "rung-omega-lite");
-        assert!(m16.is_recommended("rung-omega-lite"));
-        assert!(m16.is_recommended("rung-omega"));
+        assert_eq!(m16.recommended_choice(), "public");
+        assert_eq!(m16.recommended_choice_for_ram(), "rung-omega-lite");
+        assert_eq!(m16.recommended_models_for_ram(), &["rung-omega-lite", "rung-omega"]);
         assert!(m16.memory_warning("rung-omega").is_none());
 
         let m32 = SystemInfo { chip: "Apple M3 Max".into(), ram_gb: 36 };
-        assert_eq!(m32.recommended_choice(), "rung-omega-fa");
-        assert!(m32.is_recommended("rung-omega"));
-        assert!(m32.is_recommended("fa"));
+        assert_eq!(m32.recommended_choice_for_ram(), "rung-omega-fa");
+        assert_eq!(m32.recommended_models_for_ram(), &["rung-omega", "fa"]);
     }
 }
 
