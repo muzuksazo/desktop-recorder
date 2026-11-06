@@ -316,8 +316,26 @@ def _install_private_engine(lt, choice, root):
         return False
 
 
+def download_model_only(emit):
+    """앱의 '모델 관리' 화면용: 공개 4-bit 모델만 내려받고 끝낸다 (녹음·전사는 하지 않음).
+    보내는 줄: download(진행) → download_done(끝) 또는 error(실패)."""
+    import mlx_quantized_asr as mqa
+
+    mqa.PROGRESS_HOOK = None
+    mqa.DOWNLOAD_HOOK = lambda got, total: emit(type="download", got=int(got), total=int(total) if total else None)
+    try:
+        path = mqa.resolve_model_dir(mqa.DEFAULT_MLX_4BIT_MODEL)
+    except Exception as e:  # 인터넷 끊김·용량 부족 등: 그대로 화면에 보여 준다
+        emit(type="error", msg=f"{e}")
+        return 1
+    emit(type="download_done", path=str(path))
+    return 0
+
+
 def main():
     emit = Emitter()
+    if "--download-model" in sys.argv[1:]:
+        return download_model_only(emit)
     boosted = boost_process_windows()
 
     import live_transcribe as lt

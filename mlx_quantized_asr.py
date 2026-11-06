@@ -18,7 +18,12 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
 import numpy as np
-from huggingface_hub import snapshot_download
+
+# Hugging Face 의 새 전송 방식(Xet)은 메모리에 먼저 받고 파일에는 나중에 써서,
+# 폴더 크기로 재는 진행률이 한참 1% 에 멈춰 보인다(2026-11-06 측정: 네트워크 711MB 받는 동안 파일 68MB).
+# 일반 HTTP 로 받게 해서 진행률이 실제와 맞고, 끊겨도 받은 만큼 이어 받게 한다.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+from huggingface_hub import snapshot_download  # noqa: E402
 
 from qwen3_asr_mlx.audio import log_mel_spectrogram
 from qwen3_asr_mlx.config import ModelConfig

@@ -21,6 +21,7 @@
 
 #[allow(dead_code)]
 mod tts;
+mod updates;
 
 use std::{
     borrow::Cow,
@@ -30,18 +31,19 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{channel::mpsc, StreamExt};
 use gpui::{
-    div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rgba, size, svg, App,
+    div, relative, AnyElement, Div, Stateful, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rgba, size, svg, App,
     Application, AssetSource, Bounds, BoxShadow, ClipboardItem, Context, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, Result as GpuiResult,
     ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
     WindowOptions,
 };
 use serde::Deserialize;
+use updates::{fmt_mb, ModelState, Release};
 
 /// Maximum number of committed transcript cards retained in UI memory.
 const MAX_TRANSCRIPT_ITEMS: usize = 300;
@@ -57,6 +59,15 @@ struct EmbeddedSvgAssets;
 impl AssetSource for EmbeddedSvgAssets {
     fn load(&self, path: &str) -> GpuiResult<Option<Cow<'static, [u8]>>> {
         let svg_str: &'static str = match path {
+            "icons/download.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><path d="M5 21h14"/></svg>"#
+            }
+            "icons/folder.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>"#
+            }
+            "icons/cpu.svg" => {
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>"#
+            }
             "icons/pip.svg" => {
                 r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="3"/><rect x="12" y="11" width="8" height="7" rx="1.5" fill="currentColor"/></svg>"#
             }
@@ -653,6 +664,33 @@ enum BackendMsg {
         items: Vec<ModelItem>,
         current: String,
     },
+    /// 모델 내려받기 진행 (backend.py --download-model)
+    Download {
+        got: u64,
+        total: Option<u64>,
+    },
+    #[serde(rename = "download_done")]
+    DownloadDone {
+        path: String,
+    },
+}
+
+/// 자동 업데이트 쪽 일꾼 스레드가 화면에 보내는 소식
+enum UpdEvent {
+    Found(Release),
+    Progress(u64),
+    Ready(PathBuf),
+    Failed(String),
+}
+
+/// 화면에 보이는 업데이트 상태
+#[derive(Clone)]
+enum UpdateState {
+    None,
+    Available(Release),
+    Downloading { rel: Release, got: u64 },
+    Ready { rel: Release, staged: PathBuf },
+    Failed { rel: Option<Release>, msg: String },
 }
 
 #[derive(Deserialize, Clone)]
@@ -784,6 +822,30 @@ fn spawn_backend(
     Ok(child)
 }
 
+/// 공개 4-bit 모델만 내려받는 백엔드를 띄운다 (모델 관리 화면용)
+fn spawn_model_download(tx: mpsc::UnboundedSender<Event>) -> std::io::Result<Child> {
+    let mut child = Command::new(resolve_python_bin())
+        .args(["-X", "utf8"])
+        .arg(resolve_backend_script())
+        .arg("--download-model")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("stdout 을 piped 로 열었음");
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Ok(msg) = serde_json::from_str::<BackendMsg>(&line) else { continue };
+            if tx.unbounded_send(Event::Msg(msg)).is_err() {
+                return;
+            }
+        }
+        let _ = tx.unbounded_send(Event::Exited);
+    });
+    Ok(child)
+}
+
 // ---------------------------------------------------------------------------
 // Main Mobbin-Inspired Liquid Glass & PiP View
 // ---------------------------------------------------------------------------
@@ -887,6 +949,8 @@ enum ViewMode {
     Live,
     HistoryList,
     HistoryDetail,
+    /// 음성 인식 모델 관리 (내려받기·삭제)
+    Models,
 }
 
 #[derive(Clone)]
@@ -1097,12 +1161,19 @@ struct TranscriptView {
     history_detail: Option<(HistoryEntry, Vec<HistoryLine>)>,
     history_copied: Option<usize>,
     history_scroll: ScrollHandle,
+    /// 공개 모델 상태와 내려받는 프로세스
+    model_state: ModelState,
+    dl_gen: u64,
+    _downloader: Option<Child>,
+    /// 자동 업데이트
+    update: UpdateState,
+    upd_gen: u64,
     _backend: Option<Child>,
 }
 
 impl Drop for TranscriptView {
     fn drop(&mut self) {
-        if let Some(mut child) = self._backend.take() {
+        for mut child in [self._backend.take(), self._downloader.take()].into_iter().flatten() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1151,13 +1222,24 @@ impl TranscriptView {
             history_detail: None,
             history_copied: None,
             history_scroll: ScrollHandle::new(),
+            model_state: updates::scan_model(),
+            dl_gen: 0,
+            _downloader: None,
+            update: UpdateState::None,
+            upd_gen: 0,
             _backend: None,
         };
         view.start_backend(cx);
+        view.start_update_checks(cx);
         view
     }
 
     fn start_backend(&mut self, cx: &mut Context<Self>) {
+        // 공개 모델이 아직 없으면 백엔드 대신 '모델 내려받기'부터 한다 (끝나면 자동으로 백엔드를 띄움)
+        if self.needs_public_model() && !self.model_ready() {
+            self.start_model_download(cx);
+            return;
+        }
         let (tx, mut rx) = mpsc::unbounded();
         self.backend_gen += 1;
         let gen = self.backend_gen;
@@ -1225,6 +1307,274 @@ impl TranscriptView {
         self.push_status(status);
         self.start_backend(cx);
         cx.notify();
+    }
+
+    // ----------------------------------------------------------- 모델 관리
+
+    /// 지금 고른 모델이 공개 4-bit 모델인가 (비공개 엔진을 고른 개발용 Mac 이면 false)
+    fn needs_public_model(&self) -> bool {
+        self.model_choice.is_empty() || self.model_choice == "public"
+    }
+
+    fn model_ready(&self) -> bool {
+        matches!(self.model_state, ModelState::Installed { .. })
+    }
+
+    fn model_downloading(&self) -> bool {
+        matches!(self.model_state, ModelState::Downloading { .. })
+    }
+
+    fn kill_downloader(&mut self) {
+        if let Some(mut child) = self._downloader.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn start_model_download(&mut self, cx: &mut Context<Self>) {
+        if self.model_downloading() {
+            return;
+        }
+        let partial = updates::dir_size(&updates::public_model_dir());
+        self.dl_gen += 1;
+        let gen = self.dl_gen;
+        let (tx, mut rx) = mpsc::unbounded();
+        match spawn_model_download(tx) {
+            Ok(child) => {
+                self._downloader = Some(child);
+                self.model_state = ModelState::Downloading { got: partial, total: None };
+                self.push_status("음성 인식 모델 내려받는 중…");
+            }
+            Err(e) => {
+                self.model_state = ModelState::Failed {
+                    msg: format!("내려받기를 시작하지 못했어요: {e}"),
+                    partial_bytes: partial,
+                };
+                cx.notify();
+                return;
+            }
+        }
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = rx.next().await {
+                let alive = this.update(cx, |view, cx| {
+                    if view.dl_gen != gen {
+                        return; // 취소했거나 이미 끝난 내려받기
+                    }
+                    view.apply_download(event, cx);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_download(&mut self, event: Event, cx: &mut Context<Self>) {
+        let partial = || updates::dir_size(&updates::public_model_dir());
+        match event {
+            Event::Msg(BackendMsg::Download { got, total }) => {
+                self.model_state = ModelState::Downloading { got, total };
+            }
+            Event::Msg(BackendMsg::DownloadDone { .. }) => {
+                self.dl_gen += 1; // 뒤따르는 '종료' 알림은 무시
+                self.kill_downloader();
+                self.model_state = updates::scan_model();
+                if self.model_ready() {
+                    self.push_status("모델 준비 완료 · 듣기를 시작합니다");
+                    if self._backend.is_none() {
+                        self.start_backend(cx);
+                    }
+                } else {
+                    self.model_state = ModelState::Failed {
+                        msg: "받은 모델 파일이 완전하지 않아요. 다시 시도해 주세요.".into(),
+                        partial_bytes: partial(),
+                    };
+                }
+            }
+            Event::Msg(BackendMsg::Error { msg }) => {
+                self.dl_gen += 1;
+                self.kill_downloader();
+                self.model_state = ModelState::Failed { msg, partial_bytes: partial() };
+            }
+            Event::Exited => {
+                if self.model_downloading() {
+                    self._downloader = None;
+                    self.model_state = ModelState::Failed {
+                        msg: "내려받기가 중간에 멈췄어요. 다시 시도하면 받은 부분부터 이어서 받습니다.".into(),
+                        partial_bytes: partial(),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_model_download(&mut self, cx: &mut Context<Self>) {
+        self.dl_gen += 1;
+        self.kill_downloader();
+        self.model_state = updates::scan_model();
+        self.push_status("내려받기를 멈췄어요. 다시 받으면 이어서 받습니다.");
+        cx.notify();
+    }
+
+    fn delete_model(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.model_state, ModelState::Installed { legacy: true, .. }) {
+            return; // 예전 개발용 위치는 지우지 않는다
+        }
+        if self.model_downloading() {
+            self.dl_gen += 1;
+            self.kill_downloader();
+        }
+        if self.needs_public_model() {
+            self.backend_gen += 1;
+            self.stop_backend();
+        }
+        match updates::delete_public_model() {
+            Ok(()) => self.push_status("모델을 지웠어요. 녹음하려면 다시 내려받아 주세요."),
+            Err(e) => self.push_line(format!("모델을 지우지 못했어요: {e}"), true),
+        }
+        self.model_state = updates::scan_model();
+        cx.notify();
+    }
+
+    fn open_models(&mut self, cx: &mut Context<Self>) {
+        if !self.model_downloading() {
+            self.model_state = updates::scan_model();
+        }
+        self.view_mode = ViewMode::Models;
+        cx.notify();
+    }
+
+    // ----------------------------------------------------------- 자동 업데이트
+
+    /// 켤 때와 6시간마다 GitHub Releases 에서 새 버전을 확인한다 (.app 으로 실행할 때만)
+    fn start_update_checks(&mut self, cx: &mut Context<Self>) {
+        if updates::app_bundle_path().is_none() || env::var_os("TALKIT_NO_UPDATE").is_some() {
+            return;
+        }
+        let Some(current) = updates::current_version() else { return };
+        let (tx, mut rx) = mpsc::unbounded();
+        thread::spawn(move || loop {
+            match updates::fetch_latest() {
+                Ok(rel) if updates::is_newer(&rel.version, &current) => {
+                    if tx.unbounded_send(UpdEvent::Found(rel)).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[Talkit] 업데이트 확인 실패: {e}"),
+            }
+            thread::sleep(Duration::from_secs(6 * 3600));
+            if tx.is_closed() {
+                return;
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = rx.next().await {
+                let alive = this.update(cx, |view, cx| {
+                    view.apply_update(ev);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_update(&mut self, ev: UpdEvent) {
+        let current_rel = match &self.update {
+            UpdateState::Available(r) | UpdateState::Downloading { rel: r, .. } | UpdateState::Ready { rel: r, .. } => {
+                Some(r.clone())
+            }
+            UpdateState::Failed { rel, .. } => rel.clone(),
+            UpdateState::None => None,
+        };
+        match ev {
+            UpdEvent::Found(rel) => {
+                // 받는 중이거나 설치 준비가 끝났으면 건드리지 않는다
+                if matches!(self.update, UpdateState::None | UpdateState::Available(_) | UpdateState::Failed { .. }) {
+                    self.update = UpdateState::Available(rel);
+                }
+            }
+            UpdEvent::Progress(got) => {
+                if let UpdateState::Downloading { rel, .. } = &self.update {
+                    self.update = UpdateState::Downloading { rel: rel.clone(), got };
+                }
+            }
+            UpdEvent::Ready(staged) => {
+                if let Some(rel) = current_rel {
+                    self.update = UpdateState::Ready { rel, staged };
+                }
+            }
+            UpdEvent::Failed(msg) => self.update = UpdateState::Failed { rel: current_rel, msg },
+        }
+    }
+
+    fn start_update_download(&mut self, rel: Release, cx: &mut Context<Self>) {
+        let Some(bundle) = updates::app_bundle_path() else { return };
+        if let Some(msg) = updates::install_blocker(&bundle) {
+            self.update = UpdateState::Failed { rel: Some(rel), msg };
+            cx.notify();
+            return;
+        }
+        self.upd_gen += 1;
+        let gen = self.upd_gen;
+        self.update = UpdateState::Downloading { rel: rel.clone(), got: 0 };
+        let (tx, mut rx) = mpsc::unbounded();
+        thread::spawn(move || {
+            let ptx = tx.clone();
+            let res = updates::download_dmg(&rel, |got| {
+                let _ = ptx.unbounded_send(UpdEvent::Progress(got));
+            })
+            .and_then(|dmg| updates::prepare_update(&rel, &dmg, &bundle));
+            let _ = tx.unbounded_send(match res {
+                Ok(staged) => UpdEvent::Ready(staged),
+                Err(e) => UpdEvent::Failed(e),
+            });
+        });
+        cx.spawn(async move |this, cx| {
+            while let Some(ev) = rx.next().await {
+                let alive = this.update(cx, |view, cx| {
+                    if view.upd_gen != gen {
+                        return;
+                    }
+                    view.apply_update(ev);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 새 앱으로 바꾸고 다시 켠다 (앱은 여기서 꺼짐)
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateState::Ready { staged, .. } = &self.update else { return };
+        let Some(bundle) = updates::app_bundle_path() else { return };
+        match updates::launch_installer(&bundle, staged) {
+            Ok(()) => {
+                self.backend_gen += 1;
+                self.stop_backend();
+                self.kill_downloader();
+                cx.quit();
+            }
+            Err(msg) => {
+                let rel = match &self.update {
+                    UpdateState::Ready { rel, .. } => Some(rel.clone()),
+                    _ => None,
+                };
+                self.update = UpdateState::Failed { rel, msg };
+                cx.notify();
+            }
+        }
     }
 
     /// 전사 따라가기가 켜져 있을 때만 맨 아래로 내린다
@@ -1537,6 +1887,8 @@ impl TranscriptView {
                 }
                 self.mem_mb = mem_mb;
             }
+            // 모델 내려받기 소식은 내려받기 전용 프로세스에서만 오고 apply_download 가 처리한다
+            Event::Msg(BackendMsg::Download { .. }) | Event::Msg(BackendMsg::DownloadDone { .. }) => {}
             Event::Exited => self.push_line("백엔드가 종료됐습니다 (터미널 로그 확인)", true),
         }
     }
@@ -2139,6 +2491,347 @@ impl TranscriptView {
     // -----------------------------------------------------------------------
     // 2. Full Talkit Studio Mode (Talkit Brand Identity Guide)
     // -----------------------------------------------------------------------
+    /// 둥근 알약 버튼 (primary 면 Talkit 파랑)
+    fn pill_btn(&self, id: impl Into<SharedString>, primary: bool) -> Stateful<Div> {
+        let theme = self.preset.theme();
+        div()
+            .id(id.into())
+            .flex_none()
+            .h(px(26.0))
+            .px_3()
+            .rounded(px(999.0))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(px(11.5))
+            .bg(rgba(if primary { TALKIT_BLUE } else { theme.pill_bg }))
+            .border_1()
+            .border_color(rgba(if primary { TALKIT_BLUE } else { theme.pill_border }))
+            .text_color(rgba(if primary { 0xffffffff } else { theme.text_primary }))
+            .hover(move |d| d.bg(rgba(if primary { 0x3b57f5ff } else { theme.pill_hover_bg })))
+    }
+
+    fn progress_bar(&self, frac: f32) -> Div {
+        let theme = self.preset.theme();
+        div()
+            .w_full()
+            .h(px(6.0))
+            .rounded(px(999.0))
+            .bg(rgba(theme.pill_bg))
+            .border_1()
+            .border_color(rgba(theme.pill_border))
+            .child(
+                div()
+                    .h_full()
+                    .w(relative(frac.clamp(0.02, 1.0)))
+                    .rounded(px(999.0))
+                    .bg(rgba(TALKIT_BLUE)),
+            )
+    }
+
+    /// 음성 인식 모델 관리 화면: 상태 · 진행 막대 · 내려받기/취소/다시 시도/삭제/폴더 열기
+    fn render_model_panel(&self, is_compact: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.preset.theme();
+        let dir = updates::public_model_dir();
+
+        let (state_line, state_color): (String, u32) = match &self.model_state {
+            ModelState::Installed { bytes, legacy, .. } => (
+                format!("설치됨 · {}{}", fmt_mb(*bytes), if *legacy { " · 예전 개발용 위치" } else { "" }),
+                0x10b981ff,
+            ),
+            ModelState::Missing { partial_bytes } if *partial_bytes > 0 => (
+                format!("받다 멈춘 상태 · {} 받음 · 이어서 받을 수 있어요", fmt_mb(*partial_bytes)),
+                theme.text_secondary,
+            ),
+            ModelState::Missing { .. } => (
+                "아직 없어요 · 약 1.1GB를 한 번 내려받으면 인터넷 없이도 씁니다".into(),
+                theme.text_secondary,
+            ),
+            ModelState::Downloading { got, total } => match total {
+                Some(t) if *t > 0 => (
+                    format!(
+                        "내려받는 중 · {}% ({} / {})",
+                        (*got * 100 / *t).min(99),
+                        fmt_mb(*got),
+                        fmt_mb(*t)
+                    ),
+                    TALKIT_BLUE,
+                ),
+                _ => (format!("내려받는 중 · {}", fmt_mb(*got)), TALKIT_BLUE),
+            },
+            ModelState::Failed { msg, .. } => (msg.clone(), 0xfb7185ff),
+        };
+
+        let mut buttons = div().flex().flex_wrap().items_center().gap_2();
+        match &self.model_state {
+            ModelState::Installed { legacy, path, .. } => {
+                let path = path.clone();
+                buttons = buttons.child(
+                    self.pill_btn("model-open-folder", false)
+                        .child(icon_svg("icons/folder.svg", 12.0, theme.text_primary))
+                        .child("폴더 열기")
+                        .on_click(move |_, _, _| updates::reveal(&path)),
+                );
+                if !legacy {
+                    buttons = buttons.child(
+                        self.pill_btn("model-delete", false)
+                            .child(icon_svg("icons/trash.svg", 12.0, theme.text_primary))
+                            .child("모델 지우기")
+                            .on_click(cx.listener(|this, _, _, cx| this.delete_model(cx))),
+                    );
+                }
+            }
+            ModelState::Downloading { .. } => {
+                buttons = buttons.child(
+                    self.pill_btn("model-cancel", false)
+                        .child("내려받기 멈추기")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_model_download(cx))),
+                );
+            }
+            ModelState::Missing { partial_bytes } | ModelState::Failed { partial_bytes, .. } => {
+                let label = if matches!(self.model_state, ModelState::Failed { .. }) {
+                    "다시 시도"
+                } else if *partial_bytes > 0 {
+                    "이어서 받기"
+                } else {
+                    "내려받기 (약 1.1GB)"
+                };
+                let d1 = dir.clone();
+                buttons = buttons
+                    .child(
+                        self.pill_btn("model-download", true)
+                            .child(icon_svg("icons/download.svg", 12.0, 0xffffffff))
+                            .child(label)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_model_download(cx))),
+                    )
+                    .child(
+                        self.pill_btn("model-open-folder", false)
+                            .child(icon_svg("icons/folder.svg", 12.0, theme.text_primary))
+                            .child("폴더 열기")
+                            .on_click(move |_, _, _| updates::reveal(&d1)),
+                    );
+                if *partial_bytes > 0 {
+                    buttons = buttons.child(
+                        self.pill_btn("model-delete", false)
+                            .child(icon_svg("icons/trash.svg", 12.0, theme.text_primary))
+                            .child("받은 조각 지우기")
+                            .on_click(cx.listener(|this, _, _, cx| this.delete_model(cx))),
+                    );
+                }
+            }
+        }
+
+        let progress = match &self.model_state {
+            ModelState::Downloading { got, total: Some(t) } if *t > 0 => {
+                Some(self.progress_bar(*got as f32 / *t as f32))
+            }
+            ModelState::Downloading { .. } => Some(self.progress_bar(0.02)),
+            _ => None,
+        };
+
+        let header = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .when(self.view_mode == ViewMode::Models, |d| {
+                d.child(
+                    self.pill_btn("models-back-btn", false)
+                        .child(icon_svg("icons/back.svg", 11.5, theme.text_primary))
+                        .child("실시간")
+                        .on_click(cx.listener(|this, _, _, cx| this.close_history(cx))),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(13.0))
+                    .text_color(rgba(theme.text_primary))
+                    .child("음성 인식 모델"),
+            );
+
+        let card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .px(px(if is_compact { 14.0 } else { 20.0 }))
+            .py_4()
+            .rounded(px(18.0))
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(theme.card_bg_top), 0.0),
+                linear_color_stop(rgba(theme.card_bg_bottom), 1.0),
+            ))
+            .border_1()
+            .border_color(rgba(theme.card_border))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(icon_svg("icons/cpu.svg", 16.0, TALKIT_BLUE))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .text_color(rgba(theme.text_primary))
+                                    .child("한국어 음성 인식 · 기본 모델"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgba(theme.text_muted))
+                                    .child("Qwen3-ASR 1.7B 한국어 · 4-bit · 공개 모델"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.5))
+                    .text_color(rgba(state_color))
+                    .child(SharedString::from(state_line)),
+            )
+            .children(progress)
+            .child(buttons)
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgba(theme.text_muted))
+                    .child(SharedString::from(format!(
+                        "저장 위치: {}\n인터넷이 없는 Mac 은 다른 Mac 에서 받은 모델 폴더를 이 위치에 그대로 넣어도 됩니다.",
+                        dir.display()
+                    ))),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap_2()
+            .child(header)
+            .child(card)
+            .into_any_element()
+    }
+
+    /// 새 버전 알림 줄 (없으면 None)
+    fn render_update_banner(&self, is_compact: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = self.preset.theme();
+        let row = |id: &'static str| {
+            div()
+                .id(id)
+                .flex_none()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded(px(14.0))
+                .bg(rgba(0x4f6bff1f))
+                .border_1()
+                .border_color(rgba(0x4f6bff59))
+                .text_size(px(12.0))
+                .text_color(rgba(theme.text_primary))
+        };
+        let el = match &self.update {
+            UpdateState::None => return None,
+            UpdateState::Available(rel) => {
+                let notes = updates::short_notes(&rel.notes, 1);
+                let page = rel.page.clone();
+                let rel2 = rel.clone();
+                row("update-banner")
+                    .child(icon_svg("icons/sparkles.svg", 13.0, TALKIT_BLUE))
+                    .child(SharedString::from(format!("Talkit {} 이 나왔어요", rel.version)))
+                    .when(!is_compact && !notes.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(11.0))
+                                .text_color(rgba(theme.text_secondary))
+                                .child(SharedString::from(notes[0].clone())),
+                        )
+                    })
+                    .when(is_compact || notes.is_empty(), |d| d.child(div().flex_1()))
+                    .child(
+                        self.pill_btn("update-notes", false)
+                            .child("바뀐 내용")
+                            .on_click(move |_, _, _| {
+                                let _ = Command::new("/usr/bin/open").arg(&page).spawn();
+                            }),
+                    )
+                    .child(
+                        self.pill_btn("update-start", true)
+                            .child(icon_svg("icons/download.svg", 12.0, 0xffffffff))
+                            .child("업데이트")
+                            .on_click(cx.listener(move |this, _, _, cx| this.start_update_download(rel2.clone(), cx))),
+                    )
+                    .child(
+                        self.pill_btn("update-later", false)
+                            .child("나중에")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update = UpdateState::None;
+                                cx.notify();
+                            })),
+                    )
+            }
+            UpdateState::Downloading { rel, got } => {
+                let frac = if rel.size > 0 { *got as f32 / rel.size as f32 } else { 0.0 };
+                row("update-banner")
+                    .child(icon_svg("icons/download.svg", 13.0, TALKIT_BLUE))
+                    .child(SharedString::from(format!(
+                        "Talkit {} 받는 중 · {}%",
+                        rel.version,
+                        ((frac * 100.0) as u32).min(99)
+                    )))
+                    .child(div().flex_1().min_w(px(80.0)).child(self.progress_bar(frac)))
+            }
+            UpdateState::Ready { rel, .. } => row("update-banner")
+                .child(icon_svg("icons/check.svg", 13.0, TALKIT_BLUE))
+                .child(SharedString::from(format!("Talkit {} 설치 준비 완료 · 다시 켜면 바뀝니다", rel.version)))
+                .child(div().flex_1())
+                .child(
+                    self.pill_btn("update-install", true)
+                        .child("다시 켜서 설치")
+                        .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
+                ),
+            UpdateState::Failed { rel, msg } => {
+                let retry = rel.clone();
+                row("update-banner")
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_color(rgba(0xfb7185ff))
+                            .child(SharedString::from(format!("업데이트 실패: {msg}"))),
+                    )
+                    .when_some(retry, |d, rel| {
+                        d.child(
+                            self.pill_btn("update-retry", false)
+                                .child("다시 시도")
+                                .on_click(cx.listener(move |this, _, _, cx| this.start_update_download(rel.clone(), cx))),
+                        )
+                    })
+                    .child(
+                        self.pill_btn("update-close", false)
+                            .child("닫기")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.update = UpdateState::None;
+                                cx.notify();
+                            })),
+                    )
+            }
+        };
+        Some(el.into_any_element())
+    }
+
     fn render_history_panel(
         &self,
         is_compact: bool,
@@ -2650,8 +3343,54 @@ impl TranscriptView {
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
+                                    // 모델 관리 버튼: 받는 중이면 %, 없으면 '모델 필요'
                                     .child({
-                                        let in_history = self.view_mode != ViewMode::Live;
+                                        let in_models = self.view_mode == ViewMode::Models;
+                                        let (label, alert): (SharedString, bool) = match &self.model_state {
+                                            ModelState::Downloading { got, total: Some(t) } if *t > 0 => {
+                                                (format!("모델 {}%", (*got * 100 / *t).min(99)).into(), true)
+                                            }
+                                            ModelState::Downloading { .. } => ("모델 받는 중".into(), true),
+                                            ModelState::Installed { .. } => ("모델".into(), false),
+                                            _ if !self.needs_public_model() => ("모델".into(), false),
+                                            _ => ("모델 필요".into(), true),
+                                        };
+                                        let hi = in_models || alert;
+                                        div()
+                                            .id("models-btn")
+                                            .flex_none()
+                                            .h(px(30.0))
+                                            .px_3()
+                                            .rounded(px(999.0))
+                                            .cursor_pointer()
+                                            .bg(rgba(if hi { 0x4f6bff24 } else { theme.pill_bg }))
+                                            .border_1()
+                                            .border_color(rgba(if hi { TALKIT_BLUE } else { theme.pill_border }))
+                                            .hover(|d| d.bg(rgba(theme.pill_hover_bg)))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .text_size(px(11.5))
+                                            .text_color(rgba(if hi { TALKIT_BLUE } else { theme.text_primary }))
+                                            .child(icon_svg(
+                                                "icons/cpu.svg",
+                                                13.0,
+                                                if hi { TALKIT_BLUE } else { theme.text_primary },
+                                            ))
+                                            .when(!is_compact || alert, |d| d.child(label))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if in_models {
+                                                    this.close_history(cx);
+                                                } else {
+                                                    this.open_models(cx);
+                                                }
+                                            }))
+                                    })
+                                    .child({
+                                        let in_history = matches!(
+                                            self.view_mode,
+                                            ViewMode::HistoryList | ViewMode::HistoryDetail
+                                        );
                                         div()
                                             .id("history-btn")
                                             .flex_none()
@@ -3065,7 +3804,14 @@ impl TranscriptView {
                             ),
                     )
                     // 3. Scrollable Transcript Feed (Brand Concept Card when empty + Drag-to-Select Cards)
-                    .child(if self.view_mode != ViewMode::Live {
+                    // 새 버전 알림
+                    .children(self.render_update_banner(is_compact, cx))
+                    // 모델 관리 화면 (직접 열었거나, 기본 모델이 아직 없어서 녹음을 못 할 때)
+                    .child(if self.view_mode == ViewMode::Models
+                        || (self.view_mode == ViewMode::Live && self.needs_public_model() && !self.model_ready())
+                    {
+                        self.render_model_panel(is_compact, cx)
+                    } else if self.view_mode != ViewMode::Live {
                         self.render_history_panel(is_compact, body_font, cx).into_any_element()
                     } else {
                         div()
