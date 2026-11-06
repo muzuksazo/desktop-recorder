@@ -288,3 +288,33 @@ VERSION=1.2.1 BUILD=8 packaging/package_macos.sh
 - Windows 기본 음성(SAPI)을 쓴다. 한국어 음성(Microsoft Heami)이 있으면 자동으로 고른다. 오프라인, 추가 설치 없음.
 - 문장을 누르면 읽는다. "자동 읽기"를 켜면 새 문장마다 읽는다. "읽기 멈춤"으로 끊는다.
 - 시스템 소리를 전사 중이면 TTS 소리도 녹음된다. 읽는 동안 들어온 소리는 버리므로, 그동안 나온 수업 내용은 빠질 수 있다.
+
+---
+
+## Windows 전사 화면 (`windows_app.py`, Rust 빌드 없이)
+
+스마트 앱 컨트롤이 켜진 Windows에서는 `app/`을 빌드할 수 없습니다(빌드 중 생기는 실행 파일이 차단됨, os error 4551).
+그래서 같은 일을 하는 Python 화면을 따로 둡니다. WSL·추가 설치가 필요 없습니다.
+
+```
+[windows_app.py tkinter 화면]  ──실행──▶  [backend.py]  (위 GPUI 앱과 같은 stdout JSON 약속)
+        └── TTS: PowerShell System.Speech (Microsoft Heami)
+```
+
+### 실행
+```powershell
+python windows_app.py                        # 마이크 + 시스템 소리
+python windows_app.py --source system --topmost --auto-read
+python windows_app.py --input-wav a.wav      # 녹음 대신 파일로 시험
+```
+- 모델: `--model`을 안 주면 옆 폴더 `../qwen3_asr_1.7b_ko`를 씁니다. 그 밖의 옵션(`--chunk`, `--context`, `--pause` 등)은 그대로 `backend.py`로 넘어갑니다.
+- 다른 Python으로 백엔드를 돌리려면 `--python 경로` 또는 환경 변수 `RECORDER_PYTHON`.
+
+### TTS
+- 문장을 누르면 읽습니다. "자동 읽기"를 켜면 새 문장마다 읽고, "읽기 멈춤"으로 끊습니다.
+- 읽던 시간과 겹치고 내용이 비슷한(0.5 이상) 전사는 TTS 소리가 다시 잡힌 것으로 보고 버립니다 (`app/src/tts.rs`와 같은 규칙). 시간만 겹치고 내용이 다르면 그대로 둡니다.
+
+### 확인한 것 (2026-11-06, Windows 11 + RTX 4070 Laptop, Python 3.14)
+- 시험 wav 3문장 → 3문장 전사 (문장당 1.0~2.0초, cuda:0), 자동 읽기로 3문장 차례로 읽음
+- 읽기 멈춤 → 읽던 문장 끊고 대기열 비움, 다시 읽기 정상
+- 실제 마이크·ZEP 소리로는 아직 시험 안 함
