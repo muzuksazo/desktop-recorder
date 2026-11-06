@@ -174,3 +174,29 @@ python live_transcribe.py
 - [ ] Windows 1: 실행, GPU 유무와 지연 시간 기록
 - [ ] 나머지 PC: 같은 순서로 확인
 - [ ] txt 파일 저장 확인
+
+---
+
+## Windows + WSL2 구조 (sangyub 브랜치)
+
+스마트 앱 컨트롤이 켜진 Windows에서는 새로 빌드한 Rust 실행 파일과 일부 Python DLL이 막힙니다. 그래서 다음처럼 나눕니다.
+
+```
+[Windows] gui_client.py (tkinter)          [WSL2] backend/ (Rust)
+ - 마이크·시스템 소리 녹음      ──오디오──▶  - 4초씩 모으기, 무음 건너뛰기
+ - 전사 결과 표시·txt 저장      ◀──텍스트──  - asr_worker.py (GPU, Qwen3-ASR) 호출
+                localhost:7700 (TCP)
+```
+
+### 처음 한 번
+1. 관리자 PowerShell에서 `wsl --install` 실행 후 재부팅, Ubuntu 사용자 만들기
+2. WSL(Ubuntu) 터미널에서:
+   ```bash
+   cd /mnt/c/Users/<사용자>/Desktop/ne4/desktop-recorder
+   bash scripts/setup_wsl.sh /mnt/c/Users/<사용자>/Desktop/ne4/qwen3_asr_1.7b_ko
+   ```
+3. Windows Python에 `pip install numpy soundcard soundfile` (torch 필요 없음)
+
+### 실행
+1. WSL: `bash scripts/run_backend.sh` → "GUI 접속 대기 중"이 나올 때까지 기다림 (첫 빌드는 몇 분)
+2. Windows: `python gui_client.py` (`--source system`, `--topmost` 등 사용 가능)

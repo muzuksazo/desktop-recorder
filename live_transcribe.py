@@ -138,6 +138,31 @@ def transcribe_array(model, audio):
             pass
 
 
+def start_recorders(args, ui_q, stop_event):
+    """args.source 에 맞는 장치마다 녹음을 시작하고 [(이름, 큐)] 를 돌려준다."""
+    sources = []
+    if args.source in ("mic", "both"):
+        sources.append(("마이크", sc.default_microphone()))
+    if args.source in ("system", "both"):
+        sys_dev = find_system_audio_device(args.system_device)
+        if sys_dev is None:
+            ui_q.put(("error",
+                      "시스템 소리 장치를 못 찾았습니다. Mac은 BlackHole 설치가 필요합니다 "
+                      "(README 참고). 지금은 마이크만 씁니다."))
+            if not any(lbl == "마이크" for lbl, _ in sources):
+                sources.append(("마이크", sc.default_microphone()))
+        else:
+            sources.append(("시스템", sys_dev))
+
+    queues = []
+    for label, device in sources:
+        q = queue.Queue()
+        Recorder(device, q, stop_event, label).start()
+        queues.append((label, q))
+        ui_q.put(("status_add", f"{label}: {device.name}"))
+    return queues
+
+
 # ---------------------------------------------------------------- 전사 루프
 class Transcriber(threading.Thread):
     def __init__(self, args, ui_q, stop_event):
@@ -155,27 +180,7 @@ class Transcriber(threading.Thread):
             return
         self.ui_q.put(("status", f"듣는 중… (device={dev}, {args.chunk}초 단위)"))
 
-        # 장치 준비
-        sources = []
-        if args.source in ("mic", "both"):
-            sources.append(("마이크", sc.default_microphone()))
-        if args.source in ("system", "both"):
-            sys_dev = find_system_audio_device(args.system_device)
-            if sys_dev is None:
-                self.ui_q.put(("error",
-                               "시스템 소리 장치를 못 찾았습니다. Mac은 BlackHole 설치가 필요합니다 "
-                               "(README 참고). 지금은 마이크만 씁니다."))
-                if not any(lbl == "마이크" for lbl, _ in sources):
-                    sources.append(("마이크", sc.default_microphone()))
-            else:
-                sources.append(("시스템", sys_dev))
-
-        queues = []
-        for label, device in sources:
-            q = queue.Queue()
-            Recorder(device, q, self.stop_event, label).start()
-            queues.append((label, q))
-            self.ui_q.put(("status_add", f"{label}: {device.name}"))
+        queues = start_recorders(args, self.ui_q, self.stop_event)
 
         blocks_per_chunk = max(1, int(round(args.chunk / BLOCK_SEC)))
         out_path = args.out
@@ -223,7 +228,7 @@ class Transcriber(threading.Thread):
 
 # ---------------------------------------------------------------- 창
 class App:
-    def __init__(self, root, args):
+    def __init__(self, root, args, worker_cls=None):
         self.root = root
         self.ui_q = queue.Queue()
         self.stop_event = threading.Event()
@@ -242,7 +247,7 @@ class App:
 
         tk.Label(root, text=f"저장 파일: {args.out}", anchor="w").pack(fill="x", padx=8, pady=(0, 8))
 
-        Transcriber(args, self.ui_q, self.stop_event).start()
+        (worker_cls or Transcriber)(args, self.ui_q, self.stop_event).start()
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll()
 
