@@ -43,7 +43,7 @@ cp "$ROOT/app/target/release/recorder-app" "$C/MacOS/Talkit"
 echo "▶ 시스템 오디오 도우미 빌드"
 swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_MACOS" "$ROOT/macos_audio_tap.swift" -o "$C/Resources/macos_audio_tap"
 
-cp "$ROOT/backend.py" "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$C/Resources/"
+cp "$ROOT/backend.py" "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$ROOT/rung_runtime.py" "$C/Resources/"
 # 외부 배포판 표시: 공개 4-bit 모델만 쓴다 (비공개 Rung Ω 애드온이 있는 Mac 이어도 무시)
 echo "public" > "$C/Resources/edition.txt"
 cp "$ROOT/packaging/AppIcon.icns" "$C/Resources/AppIcon.icns"
@@ -98,7 +98,7 @@ echo "  OK"
 echo "▶ 앱이 쓰는 모듈이 실제로 불러와지는지 확인"
 # -E -s: 이 Mac 의 환경 변수·사용자 패키지를 무시하고 앱 안의 것만으로 불러온다
 "$BUNDLED_PY" -E -s -c "import sys; sys.path.insert(0, '$C/Resources'); \
-import mlx.core, numpy, soundcard, soundfile, huggingface_hub, qwen3_asr_mlx, mlx_quantized_asr, live_transcribe; \
+import mlx.core, numpy, soundcard, soundfile, huggingface_hub, tokenizers, qwen3_asr_mlx, mlx_quantized_asr, live_transcribe, rung_runtime; \
 print('  imports OK · huggingface_hub', huggingface_hub.__version__)"
 
 cat > "$C/Info.plist" <<PLIST
