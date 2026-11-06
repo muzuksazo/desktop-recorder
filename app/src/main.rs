@@ -2675,8 +2675,11 @@ impl TranscriptView {
                 if !legacy {
                     buttons = buttons.child(
                         self.pill_btn(format!("{id}-delete"), false)
-                            .child(icon_svg("icons/trash.svg", 12.0, theme.text_primary))
-                            .child("지우기")
+                            .border_color(rgba(0xfb718566))
+                            .text_color(rgba(0xfb7185ff))
+                            .hover(|d| d.bg(rgba(0xf43f5e24)))
+                            .child(icon_svg("icons/trash.svg", 12.0, 0xfb7185ff))
+                            .child("모델 제거")
                             .on_click(cx.listener(move |this, _, _, cx| this.delete_model(id, cx))),
                     );
                 }

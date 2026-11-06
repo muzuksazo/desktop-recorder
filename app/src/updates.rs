@@ -210,12 +210,9 @@ fn is_public_edition() -> bool {
         .is_some_and(|s| s.trim() == "public")
 }
 
-/// 개발용 Mac 에 이미 있는 같은 모델 (받지 않고 쓴다. 지우지 않는다)
+/// 개발용 Mac 에서 TALKIT_USE_DEV_ARTIFACTS=1 일 때만 예전 작업 폴더를 참조한다
 fn legacy_path(spec: &ModelSpec) -> Option<PathBuf> {
-    if spec.id == "public" {
-        return Some(home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit"));
-    }
-    if is_public_edition() {
+    if is_public_edition() || env::var_os("TALKIT_USE_DEV_ARTIFACTS").is_none() {
         return None;
     }
     let sub = spec.dev_dir?;
@@ -267,8 +264,24 @@ pub fn dir_size(dir: &Path) -> u64 {
 
 pub fn scan_model(spec: &ModelSpec) -> ModelState {
     let dir = model_path(spec);
+    // 예전 위치(~/qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit)에 기본 모델이 있으면 Talkit 표준 모델 폴더로 옮긴다
+    if spec.id == "public" && !is_complete(&dir) {
+        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
+        if old_public.join("model.safetensors").exists() {
+            let _ = fs::create_dir_all(models_root());
+            if !dir.exists() {
+                let _ = fs::rename(&old_public, &dir);
+            }
+        }
+    }
     if is_complete(&dir) {
         return ModelState::Installed { bytes: dir_size(&dir), path: dir, legacy: false };
+    }
+    if spec.id == "public" {
+        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
+        if old_public.join("model.safetensors").exists() {
+            return ModelState::Installed { bytes: dir_size(&old_public), path: old_public, legacy: false };
+        }
     }
     if let Some(legacy) = legacy_path(spec).filter(|p| p.join("model.safetensors").exists()) {
         return ModelState::Installed { bytes: dir_size(&legacy), path: legacy, legacy: true };
@@ -276,11 +289,17 @@ pub fn scan_model(spec: &ModelSpec) -> ModelState {
     ModelState::Missing { partial_bytes: dir_size(&dir) }
 }
 
-/// 받은 모델(또는 받다 만 조각)을 지운다. 개발용 예전 위치는 건드리지 않는다.
+/// 받은 모델(또는 받다 만 조각)을 지운다.
 pub fn delete_model(spec: &ModelSpec) -> std::io::Result<()> {
     let dir = model_path(spec);
     if dir.exists() {
         fs::remove_dir_all(dir)?;
+    }
+    if spec.id == "public" {
+        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
+        if old_public.exists() {
+            fs::remove_dir_all(old_public)?;
+        }
     }
     Ok(())
 }

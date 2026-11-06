@@ -286,7 +286,7 @@ def is_public_edition():
 def _dev_artifacts_dir():
     from pathlib import Path
 
-    if is_public_edition():
+    if is_public_edition() or not os.environ.get("TALKIT_USE_DEV_ARTIFACTS"):
         return None
     for root in (
         Path.home() / "Library" / "Application Support" / "Talkit" / "engines" / "rung-omega",

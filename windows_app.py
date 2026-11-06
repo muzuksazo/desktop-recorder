@@ -951,6 +951,8 @@ class SettingsWindow:
             r = self.row()
             tk.Radiobutton(r, text=f"{name}   {tw.dir_size(path) / 1e9:.1f}GB", value=path, variable=self.model_var,
                            command=self.on_model, bg=WHITE, activebackground=WHITE, font=(FONT, 9)).pack(side="left")
+            if os.path.normcase(path) != os.path.normcase(tw.DEV_MODEL):
+                pill(r, "모델 제거", lambda n=name, p=path: self.do_delete_model(n, p)).pack(side="right")
         have = {os.path.basename(p) for _, p in models}
         for m in tw.MODELS:
             r = self.row()
@@ -1076,6 +1078,23 @@ class SettingsWindow:
         dst = os.path.join(tw.MODELS_DIR, folder)
         self.job(f"{repo} 받기", lambda: self.tool(["download", "--repo", repo, "--dir", dst]),
                  after=lambda: self.pick_if_none(dst))
+
+    def do_delete_model(self, name, path):
+        import shutil
+        if not messagebox.askokcancel("모델 제거", f"'{name}' 모델을 지울까요?\n({path})", parent=self.win):
+            return
+        in_use = os.path.normcase(self.app.model_path() or "") == os.path.normcase(path)
+        if in_use:
+            self.app.stop_backend()
+            self.app.status = f"'{name}' 모델을 지웠어요"
+        shutil.rmtree(path, ignore_errors=True)
+        self.say(f"✓ '{name}' 모델을 지웠어요.")
+        rem = tw.installed_models()
+        if in_use:
+            write_setting("model", rem[0][1] if rem else "")
+            if rem:
+                self.app.restart_backend(f"모델을 바꾸는 중… ({rem[0][0]})")
+        self.draw()
 
     def ask_download(self):
         repo = simpledialog.askstring("다른 모델 받기", "Hugging Face 모델 주소 (예: Qwen/Qwen3-ASR-0.6B)",
