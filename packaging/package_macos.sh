@@ -101,14 +101,33 @@ cat > "$C/Info.plist" <<PLIST
 PLIST
 
 echo "▶ 서명"
-# 앱 안의 모든 실행 파일·라이브러리를 먼저 서명하고, 마지막에 앱 전체를 서명한다
+ENT="$ROOT/packaging/Entitlements.plist"
+# 다른 Mac 에서 'Apple 이 악성 소프트웨어를 확인할 수 없음' 없이 열리려면
+# 'Developer ID Application' 인증서(유료 Apple Developer Program) 서명 + Apple 공증이 필요하다.
+# 그 인증서일 때만 공증 규칙(hardened runtime, 시간 도장)을 켠다. 개인 팀 인증서·ad-hoc 은 이 Mac 테스트용.
+if [[ "$SIGN_ID" == *"Developer ID Application"* ]]; then
+  NOTARIZE=1
+  SIGN_OPTS=(--force --timestamp --options runtime)
+else
+  NOTARIZE=0
+  SIGN_OPTS=(--force --timestamp=none)
+  echo "  ⚠ Developer ID 인증서가 아니라 공증을 못 합니다. 다른 Mac 에서는 '그래도 열기'가 필요합니다."
+fi
+# 앱 안의 모든 실행 파일·라이브러리를 먼저 서명하고, 마지막에 앱 전체를 서명한다.
+# 따로 실행되는 프로그램(python3, macos_audio_tap)은 자기 프로세스라 엔타이틀먼트를 직접 달아야
+# MLX(JIT)·라이브러리 로딩이 hardened runtime 에서 막히지 않는다.
 find "$C/Resources" -type f \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) -print0 |
   while IFS= read -r -d '' f; do
-    if file -b "$f" | grep -q "Mach-O"; then
-      codesign --force --timestamp=none -s "$SIGN_ID" "$f" >/dev/null 2>&1
+    kind="$(file -b "$f")"
+    if echo "$kind" | grep -q "Mach-O"; then
+      if echo "$kind" | grep -q "executable"; then
+        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" --entitlements "$ENT" "$f" >/dev/null
+      else
+        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" "$f" >/dev/null
+      fi
     fi
   done
-codesign --force --timestamp=none -s "$SIGN_ID" --entitlements "$ROOT/packaging/Entitlements.plist" "$APP"
+codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" --entitlements "$ENT" "$APP"
 codesign --verify --deep --strict "$APP"
 echo "  서명 확인 OK"
 
@@ -117,6 +136,16 @@ ln -s /Applications "$STAGE/Applications"
 rm -f "$DMG"
 hdiutil create -volname "Talkit" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 hdiutil verify "$DMG" >/dev/null
+
+if [ "$NOTARIZE" = 1 ]; then
+  echo "▶ Apple 공증 (몇 분 걸림)"
+  # 처음 한 번: xcrun notarytool store-credentials talkit --apple-id <애플ID> --team-id <팀ID> --password <앱 암호>
+  codesign --force --timestamp -s "$SIGN_ID" "$DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile "${NOTARY_PROFILE:-talkit}" --wait
+  xcrun stapler staple "$DMG"
+  spctl -a -t open --context context:primary-signature -v "$DMG"
+  echo "  공증 완료: 다른 Mac 에서도 경고 없이 열립니다"
+fi
 # 스테이지의 앱이 LaunchServices 에 '또 하나의 Talkit' 으로 남지 않게 지운다(권한 기록 꼬임 방지)
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$APP" 2>/dev/null || true
 rm -rf "$STAGE"
