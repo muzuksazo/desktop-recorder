@@ -9,4 +9,5 @@ target/
 dist/
 *.dmg
 macos_audio_tap
+libtk_guard.dylib
 build/

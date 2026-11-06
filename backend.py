@@ -249,20 +249,18 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
 
 
 # ---------------------------------------------------------------- 모델 목록·받기·불러오기
-# 앱에서 고를 수 있는 음성 인식 모델. 모두 공개라서 로그인 없이 Hugging Face 에서 받는다.
+# 앱에서 고를 수 있는 음성 인식 모델. Cloudflare R2 에서 TKOMEGA1 암호화 상태로 로그인 없이 받는다.
 # 받은 모델은 ~/Library/Application Support/Talkit/models/<저장소 이름> 에 둔다 (앱의 updates.rs 와 같은 규칙).
 MODEL_REPOS = {
-    "public": "yeowon/qwen3_asr_1.7b_ko-MLX-4bit",
-    "rung-omega": "yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX",
     "rung-omega-lite": "yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
+    "rung-omega": "yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX",
     "fa": "yeowon/qwen3_forced_aligner_0.6b-RungOmega-MLX",  # 문장 맞추기 (Forced Aligner)
 }
 # 화면에서 고르는 항목: (id, 이름, 음성 인식 모델, 문장 맞추기 사용)
 CHOICES = [
-    ("public", "기본 모델", "public", False),
-    ("rung-omega", "Rung Ω", "rung-omega", False),
-    ("rung-omega-fa", "Rung Ω + 문장 맞추기", "rung-omega", True),
-    ("rung-omega-lite", "Rung Ω 가벼운판", "rung-omega-lite", False),
+    ("rung-omega-lite", "기본 모델", "rung-omega-lite", False),
+    ("rung-omega", "정밀 모델", "rung-omega", False),
+    ("rung-omega-fa", "정밀 모델 + 문장 맞추기", "rung-omega", True),
 ]
 # 개발용 Mac: 받지 않았어도 예전 작업 폴더의 같은 가중치를 쓴다 (외부 배포판은 보지 않음)
 _DEV_ARTIFACTS = {
@@ -299,6 +297,8 @@ def _dev_artifacts_dir():
 
 def model_dir(mid):
     """받아 둔 모델 폴더 (없으면 None)"""
+    if mid not in MODEL_REPOS:
+        return None
     try:
         import mlx_quantized_asr as mqa
     except ImportError:  # Windows 등 MLX 가 없는 PC: 이 목록의 모델(MLX 형식)은 쓸 수 없다
@@ -308,11 +308,8 @@ def model_dir(mid):
     target = mqa.talkit_models_dir() / repo.split("/")[-1]
     if mqa.model_is_complete(target):
         return target
-    if mid == "public":
-        legacy = mqa.Path.home() / "qwen3-asr-ko" / "qwen3_asr_1.7b_ko_mlx_4bit"
-        return legacy if (legacy / "model.safetensors").exists() else None
     art = _dev_artifacts_dir()
-    if art is not None and (art / _DEV_ARTIFACTS[mid] / "model.safetensors").exists():
+    if art is not None and mid in _DEV_ARTIFACTS and (art / _DEV_ARTIFACTS[mid] / "model.safetensors").exists():
         return art / _DEV_ARTIFACTS[mid]
     return None
 
@@ -327,18 +324,36 @@ def list_models():
 
 
 def _install_rung_engine(lt, choice, emit):
-    """고른 Rung Ω 구성으로 모델 로더를 바꾼다. 모델이 없거나 실패하면 False (기본 모델로 계속)."""
+    """고른 모델 구성으로 로더를 준비한다. 아직 받지 않은 모델이면 자동으로 내려받는다."""
     import sys
 
     entry = next((c for c in CHOICES if c[0] == choice), None)
-    if entry is None or entry[2] == "public":
+    if entry is None:
         return False
     _, label, asr, use_fa = entry
     asr_dir = model_dir(asr)
     fa_dir = model_dir("fa") if use_fa else None
-    if asr_dir is None or (use_fa and fa_dir is None):
-        emit(type="error", msg=f"'{label}' 모델을 아직 받지 않았어요. 모델 화면에서 받은 뒤 다시 골라 주세요. 지금은 기본 모델로 전사합니다.")
+    try:
+        import mlx_quantized_asr as mqa
+
+        if asr_dir is None:
+            emit(type="status", msg=f"'{label}' 모델을 내려받는 중…")
+            mqa.PROGRESS_HOOK = lambda msg: emit(type="status", msg=msg)
+            mqa.DOWNLOAD_HOOK = lambda got, total: emit(
+                type="download", got=int(got), total=int(total) if total else None
+            )
+            asr_dir = mqa.resolve_model_dir(MODEL_REPOS[asr])
+        if use_fa and fa_dir is None:
+            emit(type="status", msg="'문장 맞추기' 모델을 내려받는 중…")
+            mqa.PROGRESS_HOOK = lambda msg: emit(type="status", msg=msg)
+            mqa.DOWNLOAD_HOOK = lambda got, total: emit(
+                type="download", got=int(got), total=int(total) if total else None
+            )
+            fa_dir = mqa.resolve_model_dir(MODEL_REPOS["fa"])
+    except Exception as e:
+        emit(type="error", msg=f"'{label}' 모델을 내려받지 못했어요: {e}")
         return False
+
     try:
         import mlx.core as mx
         import rung_runtime
@@ -353,8 +368,8 @@ def _install_rung_engine(lt, choice, emit):
         lt.load_model = _load_rung
         sys.stderr.write(f"[Talkit] {label} 사용: {asr_dir}{' + ' + str(fa_dir) if fa_dir else ''}\n")
         return True
-    except Exception as e:  # 깨진 모델이어도 앱은 기본 모델로 계속 동작
-        emit(type="error", msg=f"'{label}' 을 불러오지 못해 기본 모델로 전사합니다: {e}")
+    except Exception as e:
+        emit(type="error", msg=f"'{label}' 을 불러오지 못했어요: {e}")
         return False
 
 
@@ -382,7 +397,7 @@ def main():
     if "--download-model" in sys.argv[1:]:
         i = sys.argv.index("--download-model")
         nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
-        return download_model_only(emit, nxt if nxt and not nxt.startswith("-") else "public")
+        return download_model_only(emit, nxt if nxt and not nxt.startswith("-") else "rung-omega-lite")
     boosted = boost_process_windows()
 
     import live_transcribe as lt
@@ -390,7 +405,7 @@ def main():
     p = argparse.ArgumentParser(description="전사 백엔드 (GPUI 앱용, 화면 없음)")
     p.add_argument("--model", default=lt.MODEL_ID, help="모델 폴더 경로 또는 HF 모델 ID")
     p.add_argument("--source", choices=["both", "mic", "system"], default="both")
-    p.add_argument("--model-choice", default="", help="쓸 모델 id (public / rung-omega / rung-omega-fa / rung-omega-lite)")
+    p.add_argument("--model-choice", default="", help="쓸 모델 id (rung-omega-lite / rung-omega / rung-omega-fa)")
     p.add_argument("--chunk", type=float, default=6.0, help="최대 발화 구간 길이(초, 기본 6)")
     p.add_argument("--device", default="auto", help="auto / mlx / cuda:0 / mps / cpu")
     p.add_argument("--system-device", default=None, help="시스템 소리 장치 이름(일부만 써도 됨)")
@@ -411,9 +426,11 @@ def main():
     # 쓸 수 있는 모델을 앱에 알려 주고, 고른 모델을 준비한다
     models = list_models()
     ids = [m["id"] for m in models]
-    choice = args.model_choice if args.model_choice in ids else "public"
-    if choice != "public" and not _install_rung_engine(lt, choice, emit):
-        choice = "public"
+    choice = args.model_choice if args.model_choice in ids else "rung-omega-lite"
+    if not _install_rung_engine(lt, choice, emit) and choice != "rung-omega-lite":
+        choice = "rung-omega-lite"
+        _install_rung_engine(lt, choice, emit)
+    models = list_models()
     emit(type="models", items=models, current=choice)
     args.language = args.language or None
 

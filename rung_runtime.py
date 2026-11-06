@@ -10,13 +10,12 @@ Talkit Rung Ω 추론 엔진 (Apple Silicon MLX 전용, torch 불필요).
 """
 from __future__ import annotations
 
+import ctypes
 import gc
-import hashlib
 import io
 import json
 import math
 import os
-import struct
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,75 +31,41 @@ from qwen3_asr_mlx.encoder import AudioEncoder, load_encoder_weights
 from qwen3_asr_mlx.tokenizer import AUDIO_PAD_TOKEN_ID, EOS_TOKEN_IDS, Tokenizer, parse_language_and_output
 
 SAMPLE_RATE = 16000
-_TK_MAGIC = b"TKOMEGA1"
-_TK_STRIDE = 1048576
-_TK_BLOCK = 4096
-_CACHED_TK_KEY: Optional[bytes] = None
+_TK_GUARD_LIB: Any = None
 
 
-def _get_tkomega_key() -> bytes:
-    global _CACHED_TK_KEY
-    if _CACHED_TK_KEY is not None:
-        return _CACHED_TK_KEY
-    raw_hex = os.environ.pop("TALKIT_MODEL_KEY", "").strip()
-    if not raw_hex:
-        for p in (
-            Path.home() / ".config" / "talkit" / "r2.env",
-            Path.home() / "Library" / "Application Support" / "Talkit" / "r2.env",
-        ):
-            if p.is_file():
-                try:
-                    for line in p.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if line.startswith("TALKIT_MODEL_KEY="):
-                            raw_hex = line.split("=", 1)[1].strip()
-                            break
-                except OSError:
-                    pass
-            if raw_hex:
-                break
-    if len(raw_hex) != 64:
-        raise RuntimeError(
-            "이 모델은 Talkit 전용 암호화(TKOMEGA1) 포맷으로 보호되어 있습니다. 정식 Talkit 앱에서 실행해 주세요."
-        )
-    _CACHED_TK_KEY = bytes.fromhex(raw_hex)
-    return _CACHED_TK_KEY
+def _get_tk_guard() -> Any:
+    global _TK_GUARD_LIB
+    if _TK_GUARD_LIB is not None:
+        return _TK_GUARD_LIB
+    here = Path(__file__).resolve().parent
+    dylib = here / "libtk_guard.dylib"
+    if not dylib.is_file():
+        raise RuntimeError("정식 Talkit 앱 보안 모듈(libtk_guard.dylib)을 찾을 수 없습니다.")
+    lib = ctypes.CDLL(str(dylib))
+    lib.tk_verify_tensor_buf.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.tk_verify_tensor_buf.restype = ctypes.c_int
+    _TK_GUARD_LIB = lib
+    return lib
 
 
 def _load_safetensors_auto(path: str | Path) -> Dict[str, mx.array]:
-    """평문 safetensors 와 Talkit 전용 암호화(TKOMEGA1) 포맷을 모두 메모리에서 불러온다."""
     p = Path(path)
     with open(p, "rb") as f:
         head8 = f.read(8)
-        if head8 != _TK_MAGIC:
+        if head8[:2] != b"TK":
             return mx.load(str(p))
         f.seek(0)
         buf = bytearray(f.read())
 
-    key = _get_tkomega_key()
+    lib = _get_tk_guard()
+    c_buf = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+    rc = lib.tk_verify_tensor_buf(ctypes.addressof(c_buf), len(buf))
+    if rc == 1:
+        return mx.load(str(p))
+    if rc != 0:
+        raise RuntimeError(f"Talkit 보안 모델 검증 실패 (code={rc})")
     mv = memoryview(buf)[8:]
-    ks8 = hashlib.pbkdf2_hmac("sha256", key, b"tkomega1-hdr", 1, dklen=8)
-    hdr_len = struct.unpack("<Q", bytes(a ^ b for a, b in zip(mv[:8], ks8)))[0]
-    hdr_total = 8 + hdr_len
-    if hdr_total > len(mv):
-        raise RuntimeError("TKOMEGA1 모델 복호화 키가 올바르지 않거나 파일이 손상되었습니다.")
-
-    ks_hdr = hashlib.pbkdf2_hmac("sha256", key, b"tkomega1-hdr", 1, dklen=hdr_total)
-    hdr_arr = np.frombuffer(mv[:hdr_total], dtype=np.uint8)
-    hdr_arr ^= np.frombuffer(ks_hdr, dtype=np.uint8)
-
-    payload_mv = mv[hdr_total:]
-    n_chunks = len(payload_mv) // _TK_STRIDE
-    if n_chunks > 0:
-        ks_body = hashlib.pbkdf2_hmac(
-            "sha256", key, b"tkomega1-body", 1, dklen=n_chunks * _TK_BLOCK
-        )
-        arr = np.frombuffer(payload_mv, dtype=np.uint8)[: n_chunks * _TK_STRIDE].reshape(
-            n_chunks, _TK_STRIDE
-        )
-        ks = np.frombuffer(ks_body, dtype=np.uint8).reshape(n_chunks, _TK_BLOCK)
-        arr[:, :_TK_BLOCK] ^= ks
-
     return mx.load(io.BytesIO(mv), format="safetensors")
 
 

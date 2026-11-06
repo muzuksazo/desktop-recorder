@@ -43,8 +43,12 @@ cp "$ROOT/app/target/release/recorder-app" "$C/MacOS/Talkit"
 echo "▶ 시스템 오디오 도우미 빌드"
 swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_MACOS" "$ROOT/macos_audio_tap.swift" -o "$C/Resources/macos_audio_tap"
 
-cp "$ROOT/backend.py" "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$ROOT/rung_runtime.py" "$C/Resources/"
-# 외부 배포판 표시: 공개 4-bit 모델만 쓴다 (비공개 Rung Ω 애드온이 있는 Mac 이어도 무시)
+cp "$ROOT/backend.py" "$C/Resources/_tk_entry.py"
+cp "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$ROOT/rung_runtime.py" "$C/Resources/"
+if [ -f "$ROOT/libtk_guard.dylib" ]; then
+  cp "$ROOT/libtk_guard.dylib" "$C/Resources/libtk_guard.dylib"
+fi
+# 외부 배포판 표시
 echo "public" > "$C/Resources/edition.txt"
 cp "$ROOT/packaging/AppIcon.icns" "$C/Resources/AppIcon.icns"
 
@@ -95,11 +99,27 @@ if [ -n "$too_new" ]; then
 fi
 echo "  OK"
 
+echo "▶ 파이썬 핵심 모듈 바이트코드 컴파일 (원문 .py 제거)"
+"$BUNDLED_PY" -OO -m compileall -b -q -s "$C/Resources" -p "" \
+  "$C/Resources/_tk_entry.py" \
+  "$C/Resources/live_transcribe.py" \
+  "$C/Resources/mlx_quantized_asr.py" \
+  "$C/Resources/rung_runtime.py"
+rm -f "$C/Resources/_tk_entry.py" \
+      "$C/Resources/live_transcribe.py" \
+      "$C/Resources/mlx_quantized_asr.py" \
+      "$C/Resources/rung_runtime.py"
+cat > "$C/Resources/backend.py" <<'PYEOF'
+import _tk_entry
+raise SystemExit(_tk_entry.main())
+PYEOF
+
 echo "▶ 앱이 쓰는 모듈이 실제로 불러와지는지 확인"
 # -E -s: 이 Mac 의 환경 변수·사용자 패키지를 무시하고 앱 안의 것만으로 불러온다
 "$BUNDLED_PY" -E -s -c "import sys; sys.path.insert(0, '$C/Resources'); \
-import mlx.core, numpy, soundcard, soundfile, huggingface_hub, tokenizers, qwen3_asr_mlx, mlx_quantized_asr, live_transcribe, rung_runtime; \
-print('  imports OK · huggingface_hub', huggingface_hub.__version__)"
+import mlx.core, numpy, soundcard, soundfile, huggingface_hub, tokenizers, qwen3_asr_mlx, mlx_quantized_asr, live_transcribe, rung_runtime, _tk_entry; \
+assert rung_runtime._get_tk_guard() is not None; \
+print('  imports + libtk_guard OK · huggingface_hub', huggingface_hub.__version__)"
 
 cat > "$C/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

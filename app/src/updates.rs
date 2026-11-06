@@ -42,62 +42,40 @@ pub struct ModelSpec {
     dev_dir: Option<&'static str>,
 }
 
-pub const MODELS: [ModelSpec; 4] = [
+pub const MODELS: [ModelSpec; 3] = [
     ModelSpec {
-        id: "public",
-        dir: "qwen3_asr_1.7b_ko-MLX-4bit",
+        id: "rung-omega-lite",
+        dir: "qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
         label: "기본 모델",
-        desc: "Qwen3-ASR 1.7B 한국어 · 4-bit · 가장 가볍고 빠름",
-        approx: "1.1GB",
+        desc: "4-bit · 가볍고 빠른 기본 한국어 음성 인식",
+        approx: "1.6GB",
         public_download: true,
-        dev_dir: None,
+        dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_mac_mlx"),
     },
     ModelSpec {
         id: "rung-omega",
         dir: "qwen3_asr_1.7b_ko-RungOmega-MLX",
-        label: "Rung Ω",
-        desc: "정확도 우선 · 한국어 전용 출력층으로 빠르게",
+        label: "정밀 모델",
+        desc: "정확도 우선 · 전문 용어·긴 문장 인식 강화",
         approx: "2.5GB",
-        public_download: false,
+        public_download: true,
         dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_g128_mlx"),
-    },
-    ModelSpec {
-        id: "rung-omega-lite",
-        dir: "qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
-        label: "Rung Ω 가벼운판",
-        desc: "Rung Ω 4-bit · 메모리를 적게 씀",
-        approx: "1.6GB",
-        public_download: false,
-        dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_mac_mlx"),
     },
     ModelSpec {
         id: "fa",
         dir: "qwen3_forced_aligner_0.6b-RungOmega-MLX",
-        label: "문장 맞추기 (Forced Aligner)",
-        desc: "Rung Ω 와 함께 켜면 단어 시각을 맞춰 문장 끝 잘림·유령 단어를 줄임",
+        label: "문장 맞추기",
+        desc: "정밀 모델과 함께 켜면 단어 시각을 맞춰 문장 끝 잘림·유령 단어를 줄임",
         approx: "0.97GB",
-        public_download: false,
+        public_download: true,
         dev_dir: Some("qwen3_forced_aligner_0_6b_rung_omega_mac_mlx"),
     },
 ];
 
 include!(concat!(env!("OUT_DIR"), "/tk_key.rs"));
 
-/// 빌드 시점에 네이티브 바이너리에 난독화되어 내장된 TKOMEGA1 모델 복호화 키를 메모리에서 복원한다.
-pub fn embedded_model_key() -> Option<String> {
-    if !TK_HAS_KEY {
-        return None;
-    }
-    let mut out = String::with_capacity(64);
-    for i in 0..32 {
-        let b = TK_ENC[i] ^ TK_MASK[i];
-        out.push_str(&format!("{:02x}", b));
-    }
-    Some(out)
-}
-
 pub fn has_r2_access() -> bool {
-    if embedded_model_key().is_some()
+    if TK_HAS_KEY
         || env::var_os("TALKIT_R2_PRESIGN_URL").is_some()
         || env::var_os("R2_ACCESS_KEY_ID").is_some()
     {
@@ -123,16 +101,19 @@ pub fn spec(id: &str) -> Option<&'static ModelSpec> {
 }
 
 /// 화면에서 고르는 항목: (id, 이름, 필요한 모델들)
-pub const CHOICES: [(&str, &str, &[&str]); 4] = [
-    ("public", "기본 모델", &["public"]),
-    ("rung-omega", "Rung Ω", &["rung-omega"]),
-    ("rung-omega-fa", "Rung Ω + 문장 맞추기", &["rung-omega", "fa"]),
-    ("rung-omega-lite", "Rung Ω 가벼운판", &["rung-omega-lite"]),
+pub const CHOICES: [(&str, &str, &[&str]); 3] = [
+    ("rung-omega-lite", "기본 모델", &["rung-omega-lite"]),
+    ("rung-omega", "정밀 모델", &["rung-omega"]),
+    ("rung-omega-fa", "정밀 모델 + 문장 맞추기", &["rung-omega", "fa"]),
 ];
 
 /// 고른 항목에 필요한 모델 id 들 (모르는 값·빈 값이면 기본 모델)
 pub fn required_models(choice: &str) -> &'static [&'static str] {
-    CHOICES.iter().find(|c| c.0 == choice).map(|c| c.2).unwrap_or(&["public"])
+    CHOICES
+        .iter()
+        .find(|c| c.0 == choice)
+        .map(|c| c.2)
+        .unwrap_or(&["rung-omega-lite"])
 }
 
 /// 이 Mac 의 칩 이름과 통합 메모리(GB)를 바탕으로 알맞은 모델을 추천한다
@@ -143,18 +124,13 @@ pub struct SystemInfo {
 }
 
 impl SystemInfo {
-    /// 메모리에 따라 가장 알맞은 CHOICES 항목 id (비공개 모델이 숨겨진 상태면 기본 모델)
+    /// 메모리에 따라 가장 알맞은 CHOICES 항목 id
     pub fn recommended_choice(&self) -> &'static str {
-        if !show_private_models() {
-            return "public";
-        }
         self.recommended_choice_for_ram()
     }
 
     pub fn recommended_choice_for_ram(&self) -> &'static str {
-        if self.ram_gb <= 8 {
-            "public"
-        } else if self.ram_gb <= 18 {
+        if self.ram_gb <= 18 {
             "rung-omega-lite"
         } else {
             "rung-omega-fa"
@@ -163,15 +139,12 @@ impl SystemInfo {
 
     /// 모델 카드에 '이 Mac 추천' 배지를 붙일 모델 id 들
     pub fn recommended_models(&self) -> &'static [&'static str] {
-        if !show_private_models() {
-            return &["public"];
-        }
         self.recommended_models_for_ram()
     }
 
     pub fn recommended_models_for_ram(&self) -> &'static [&'static str] {
         if self.ram_gb <= 8 {
-            &["public"]
+            &["rung-omega-lite"]
         } else if self.ram_gb <= 18 {
             &["rung-omega-lite", "rung-omega"]
         } else {
@@ -185,25 +158,19 @@ impl SystemInfo {
 
     /// 모델 화면 맨 위에 보여 줄 한 줄 안내
     pub fn summary_line(&self) -> String {
-        if !show_private_models() {
-            return format!(
-                "이 Mac ({} · {}GB) → '기본 모델(1.1GB · MLX 4-bit)'을 추천해요",
-                self.chip, self.ram_gb
-            );
-        }
         if self.ram_gb <= 8 {
             format!(
-                "이 Mac ({} · {}GB) → 가볍고 빠른 '기본 모델(1.1GB)'을 추천해요",
+                "이 Mac ({} · {}GB) → 가볍고 빠른 '기본 모델(1.6GB)'을 추천해요",
                 self.chip, self.ram_gb
             )
         } else if self.ram_gb <= 18 {
             format!(
-                "이 Mac ({} · {}GB) → 'Rung Ω 가벼운판(1.6GB)' 또는 'Rung Ω(2.5GB)'를 추천해요",
+                "이 Mac ({} · {}GB) → '기본 모델(1.6GB)' 또는 '정밀 모델(2.5GB)'을 추천해요",
                 self.chip, self.ram_gb
             )
         } else {
             format!(
-                "이 Mac ({} · {}GB) → 가장 정확한 'Rung Ω + 문장 맞추기' 조합을 추천해요",
+                "이 Mac ({} · {}GB) → 가장 정확한 '정밀 모델 + 문장 맞추기' 조합을 추천해요",
                 self.chip, self.ram_gb
             )
         }
@@ -213,8 +180,8 @@ impl SystemInfo {
     pub fn memory_warning(&self, model_id: &str) -> Option<&'static str> {
         if self.ram_gb <= 8 {
             match model_id {
-                "rung-omega" => Some("8GB Mac 에서는 다른 앱과 함께 쓸 때 메모리가 빡빡할 수 있어요. '기본 모델'이나 'Rung Ω 가벼운판'을 권장합니다."),
-                "fa" => Some("8GB Mac 에서는 Rung Ω 와 함께 켜면(총 3.5GB) 메모리가 부족할 수 있어요."),
+                "rung-omega" => Some("8GB Mac 에서는 다른 앱과 함께 쓸 때 메모리가 빡빡할 수 있어요. '기본 모델'을 권장합니다."),
+                "fa" => Some("8GB Mac 에서는 정밀 모델과 함께 켜면(총 3.5GB) 메모리가 부족할 수 있어요."),
                 _ => None,
             }
         } else {
@@ -327,24 +294,8 @@ pub fn dir_size(dir: &Path) -> u64 {
 
 pub fn scan_model(spec: &ModelSpec) -> ModelState {
     let dir = model_path(spec);
-    // 예전 위치(~/qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit)에 기본 모델이 있으면 Talkit 표준 모델 폴더로 옮긴다
-    if spec.id == "public" && !is_complete(&dir) {
-        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
-        if old_public.join("model.safetensors").exists() {
-            let _ = fs::create_dir_all(models_root());
-            if !dir.exists() {
-                let _ = fs::rename(&old_public, &dir);
-            }
-        }
-    }
     if is_complete(&dir) {
         return ModelState::Installed { bytes: dir_size(&dir), path: dir, legacy: false };
-    }
-    if spec.id == "public" {
-        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
-        if old_public.join("model.safetensors").exists() {
-            return ModelState::Installed { bytes: dir_size(&old_public), path: old_public, legacy: false };
-        }
     }
     if let Some(legacy) = legacy_path(spec).filter(|p| p.join("model.safetensors").exists()) {
         return ModelState::Installed { bytes: dir_size(&legacy), path: legacy, legacy: true };
@@ -357,12 +308,6 @@ pub fn delete_model(spec: &ModelSpec) -> std::io::Result<()> {
     let dir = model_path(spec);
     if dir.exists() {
         fs::remove_dir_all(dir)?;
-    }
-    if spec.id == "public" {
-        let old_public = home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit");
-        if old_public.exists() {
-            fs::remove_dir_all(old_public)?;
-        }
     }
     Ok(())
 }
@@ -711,12 +656,12 @@ mod tests {
     #[test]
     fn system_recommendations() {
         let m8 = SystemInfo { chip: "Apple M1".into(), ram_gb: 8 };
-        assert_eq!(m8.recommended_choice_for_ram(), "public");
-        assert_eq!(m8.recommended_models_for_ram(), &["public"]);
+        assert_eq!(m8.recommended_choice_for_ram(), "rung-omega-lite");
+        assert_eq!(m8.recommended_models_for_ram(), &["rung-omega-lite"]);
         assert!(m8.memory_warning("rung-omega").is_some());
 
         let m16 = SystemInfo { chip: "Apple M1 Pro".into(), ram_gb: 16 };
-        assert_eq!(m16.recommended_choice(), "public");
+        assert_eq!(m16.recommended_choice(), "rung-omega-lite");
         assert_eq!(m16.recommended_choice_for_ram(), "rung-omega-lite");
         assert_eq!(m16.recommended_models_for_ram(), &["rung-omega-lite", "rung-omega"]);
         assert!(m16.memory_warning("rung-omega").is_none());

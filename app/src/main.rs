@@ -800,9 +800,6 @@ fn spawn_backend(
     if !model_choice.is_empty() {
         cmd.args(["--model-choice", model_choice]);
     }
-    if let Some(tk_key) = updates::embedded_model_key() {
-        cmd.env("TALKIT_MODEL_KEY", tk_key);
-    }
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -839,9 +836,6 @@ fn spawn_model_download(tx: mpsc::UnboundedSender<Event>, model_id: &str) -> std
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    if let Some(tk_key) = updates::embedded_model_key() {
-        cmd.env("TALKIT_MODEL_KEY", tk_key);
-    }
     let mut child = cmd.spawn()?;
     let stdout = child.stdout.take().expect("stdout 을 piped 로 열었음");
     thread::spawn(move || {
@@ -2647,7 +2641,7 @@ impl TranscriptView {
                 if rung_ready {
                     buttons = buttons.child(
                         self.pill_btn(format!("{id}-toggle"), !on)
-                            .child(if on { "문장 맞추기 끄기" } else { "Rung Ω 에 문장 맞추기 켜기" })
+                            .child(if on { "문장 맞추기 끄기" } else { "정밀 모델에 문장 맞추기 켜기" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_model(if on { "rung-omega".into() } else { "rung-omega-fa".into() }, cx)
                             })),
