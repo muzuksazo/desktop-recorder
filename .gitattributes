@@ -1,4 +1,5 @@
 # 줄바꿈을 저장소 안에서는 LF 로 통일 (Windows·Mac 팀원끼리 머지할 때 줄 전체가 바뀌는 충돌 방지)
 * text=auto eol=lf
+*.sh text eol=lf
 *.wav binary
 *.png binary

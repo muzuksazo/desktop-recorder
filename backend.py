@@ -72,7 +72,11 @@ def boost_process_windows():
 
 # ---------------------------------------------------------------- 녹음 + VAD
 class Segmenter(threading.Thread):
-    """녹음 블록을 받아 VAD 로 말 구간을 찾고, 끝난 구간을 seg_q 에 넣는다."""
+    """녹음 블록을 받아 VAD 로 말 구간을 찾고, 끝난 구간을 seg_q 에 넣는다.
+
+    입력이 여러 개(마이크 + 시스템)면 섞어서 한 번만 전사한다 (스피커 소리가 마이크로 다시 잡혀
+    같은 말이 두 번 나오는 걸 막기 위해). 대신 구간마다 어느 입력이 더 컸는지 보고 출처를 붙인다.
+    """
 
     def __init__(self, args, queues, seg_q, emit, stop):
         super().__init__(daemon=True)
@@ -96,27 +100,49 @@ class Segmenter(threading.Thread):
         pre = []         # 말 시작 전 프레임 몇 개
         seg = []         # 지금 말하는 구간의 프레임들
         probs = []       # seg 각 프레임의 VAD 확률
+        pre_en = []      # pre 각 프레임의 입력별 소리 크기 {라벨: rms}
+        ens = []         # seg 각 프레임의 입력별 소리 크기
+        labels = [lbl for lbl, _ in self.queues]
+        single = labels[0] if len(labels) == 1 and labels[0] != "파일" else None
+        level_t = 0.0
         seg_start = 0.0
         silent = 0
 
         def voiced_count(ps):
             return sum(1 for x in ps if x >= a.vad)
 
-        def emit_seg(frames, ps, start):
+        def pick_source(es, ps):
+            """말소리 프레임에서 소리가 더 컸던 입력 (입력이 하나면 그 입력, 파일 시험이면 None)"""
+            if len(labels) == 1:
+                return single
+            tot = {lbl: 0.0 for lbl in labels}
+            for e, p in zip(es, ps):
+                if p >= a.vad:
+                    for lbl, v in e.items():
+                        tot[lbl] += v
+            return max(tot, key=tot.get)
+
+        def emit_seg(frames, ps, es, start):
             if voiced_count(ps) >= min_frames:
-                self.seg_q.put((np.concatenate(frames), start, start + len(frames) * fdur))
+                self.seg_q.put((np.concatenate(frames), start, start + len(frames) * fdur,
+                                pick_source(es, ps)))
 
         while not self.stop.is_set():
             mixed = None
+            block_en = {}
             for label, q in self.queues:
                 item = q.get()
                 if isinstance(item, Exception):
                     self.emit(type="error", msg=str(item))
                     return
+                block_en[label] = float(np.sqrt(np.mean(item ** 2))) if len(item) else 0.0
                 mixed = item if mixed is None else mixed[: len(item)] + item[: len(mixed)]
             if len(self.queues) > 1:
                 mixed = mixed / len(self.queues)
             now = time.time()
+            if now - level_t >= 0.1:  # 화면의 소리 크기 막대용 (0~1)
+                level_t = now
+                self.emit(type="level", rms=round(min(1.0, max(block_en.values(), default=0.0) / 0.08), 3))
 
             buf = np.concatenate([leftover, mixed])
             n = len(buf) // VAD_FRAME
@@ -134,27 +160,30 @@ class Segmenter(threading.Thread):
                     if speech:
                         seg = pre + [frame]
                         probs = [0.0] * len(pre) + [prob]
+                        ens = pre_en + [block_en]
                         seg_start = t_frame - len(pre) * fdur
                         silent = 0
-                        pre = []
+                        pre, pre_en = [], []
                     else:
                         pre = (pre + [frame])[-pre_frames:]
+                        pre_en = (pre_en + [block_en])[-pre_frames:]
                     continue
 
                 seg.append(frame)
                 probs.append(prob)
+                ens.append(block_en)
                 silent = 0 if speech else silent + 1
 
                 if silent >= end_frames:
                     keep = len(seg) - silent + int(0.3 / fdur)
-                    emit_seg(seg[:keep], probs[:keep], seg_start)
-                    seg, probs, silent = [], [], 0
+                    emit_seg(seg[:keep], probs[:keep], ens[:keep], seg_start)
+                    seg, probs, ens, silent = [], [], [], 0
                 elif len(seg) >= max_frames:
                     lo = max(min_frames, len(seg) - search_frames)
                     cut = min(range(lo, len(seg)), key=lambda j: probs[j])
-                    emit_seg(seg[:cut], probs[:cut], seg_start)
+                    emit_seg(seg[:cut], probs[:cut], ens[:cut], seg_start)
                     seg_start += cut * fdur
-                    seg, probs = seg[cut:], probs[cut:]
+                    seg, probs, ens = seg[cut:], probs[cut:], ens[cut:]
 
 
 def feed_wavs(paths, q, stop, block_sec=0.2):
@@ -187,7 +216,7 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
     context = args.context.strip()
     while not stop.is_set() and not emit.broken.is_set():
         try:
-            audio, start, end = seg_q.get(timeout=0.2)
+            audio, start, end, source = seg_q.get(timeout=0.2)
         except queue.Empty:
             continue
 
@@ -211,10 +240,12 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
             continue
 
         clock = dt.datetime.fromtimestamp(start).strftime("%H:%M:%S")
+        # 출처가 있으면 Mac 경로와 같은 모양으로 붙인다: "[시스템] 문장" (앱은 이 머리말로 출처를 표시)
+        labeled = f"[{source}] {text}" if source else text
         with open(out_path, "a", encoding="utf-8") as f:
-            f.write(f"[{clock}] {text}\n")
-        emit(type="text", text=text, clock=clock, start=round(start, 3), end=round(end, 3),
-             infer_sec=round(infer, 2))
+            f.write(f"[{clock}] {labeled}\n")
+        emit(type="text", text=labeled, clock=clock, start=round(start, 3), end=round(end, 3),
+             infer_sec=round(infer, 2), source=source)
 
 
 def private_engine_dirs():

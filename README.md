@@ -1,3 +1,6 @@
+> 📢 **Talkit for Windows 공개** — Mac 앱 Talkit 1.2.0의 Windows 판입니다. `python windows_app.py` 로 실행하세요.
+> 설치·기능은 아래 [Talkit for Windows](#talkit-for-windows-windows_apppy) 절을 보세요.
+
 # 실시간 한국어 강의 전사 (1시간 MVP)
 
 ZEP 수업 소리를 마이크로 받아 3~5초 단위로 한국어 전사하고, 터미널에 이어서 보여주며 `.txt`로 자동 저장합니다.
@@ -177,6 +180,32 @@ python live_transcribe.py
 
 ---
 
+## Windows + WSL2 구조 (sangyub 브랜치)
+
+스마트 앱 컨트롤이 켜진 Windows에서는 새로 빌드한 Rust 실행 파일과 일부 Python DLL이 막힙니다. 그래서 다음처럼 나눕니다.
+
+```
+[Windows] gui_client.py (tkinter)          [WSL2] backend/ (Rust)
+ - 마이크·시스템 소리 녹음      ──오디오──▶  - 4초씩 모으기, 무음 건너뛰기
+ - 전사 결과 표시·txt 저장      ◀──텍스트──  - asr_worker.py (GPU, Qwen3-ASR) 호출
+                localhost:7700 (TCP)
+```
+
+### 처음 한 번
+1. 관리자 PowerShell에서 `wsl --install` 실행 후 재부팅, Ubuntu 사용자 만들기
+2. WSL(Ubuntu) 터미널에서:
+   ```bash
+   cd /mnt/c/Users/<사용자>/Desktop/ne4/desktop-recorder
+   bash scripts/setup_wsl.sh /mnt/c/Users/<사용자>/Desktop/ne4/qwen3_asr_1.7b_ko
+   ```
+3. Windows Python에 `pip install numpy soundcard soundfile` (torch 필요 없음)
+
+### 실행
+1. WSL: `bash scripts/run_backend.sh` → "GUI 접속 대기 중"이 나올 때까지 기다림 (첫 빌드는 몇 분)
+2. Windows: `python gui_client.py` (`--source system`, `--topmost` 등 사용 가능)
+
+---
+
 ## Talkit Mac 앱 (DMG 설치 · 모델 위치)
 
 ### 설치
@@ -294,3 +323,64 @@ VERSION=1.2.1 BUILD=8 packaging/package_macos.sh
 - Windows 기본 음성(SAPI)을 쓴다. 한국어 음성(Microsoft Heami)이 있으면 자동으로 고른다. 오프라인, 추가 설치 없음.
 - 문장을 누르면 읽는다. "자동 읽기"를 켜면 새 문장마다 읽는다. "읽기 멈춤"으로 끊는다.
 - 시스템 소리를 전사 중이면 TTS 소리도 녹음된다. 읽는 동안 들어온 소리는 버리므로, 그동안 나온 수업 내용은 빠질 수 있다.
+
+---
+
+## Talkit for Windows (`windows_app.py`)
+
+Mac 앱 **Talkit 1.2.0**의 Windows 판입니다. ZEP 강의 소리(시스템 소리)와 마이크를 실시간으로 받아 적습니다.
+Rust 빌드가 필요 없어서 스마트 앱 컨트롤이 켜진 Windows에서도 돌아갑니다(`app/` 빌드는 os error 4551로 차단됨). WSL도 필요 없습니다.
+
+```
+[windows_app.py 화면(tkinter)]  ──실행──▶  [backend.py]  (GPUI 앱과 같은 stdout JSON 약속)
+        └── TTS: PowerShell System.Speech (Microsoft Heami)
+```
+
+### 처음 한 번
+1. Python 3.11 이상, `pip install -r requirements.txt`
+2. NVIDIA GPU가 있으면 https://pytorch.org 에서 CUDA 버전 torch로 다시 설치 (없으면 CPU로 돌지만 느림)
+3. 모델: `../qwen3_asr_1.7b_ko` 폴더에 받아 두면 그걸 쓰고, 없으면 첫 실행 때 Hugging Face에서 내려받습니다.
+
+### 실행
+```powershell
+python windows_app.py                        # 지난번 입력 설정으로 (처음엔 마이크 + 시스템 소리)
+python windows_app.py --source system --topmost --auto-read
+python windows_app.py --input-wav a.wav      # 녹음 대신 파일로 시험
+```
+- 그 밖의 옵션(`--chunk`, `--context "러스트, 백엔드"`, `--pause` 등)은 그대로 `backend.py`로 넘어갑니다.
+- 다른 Python으로 백엔드를 돌리려면 `--python 경로` 또는 환경 변수 `RECORDER_PYTHON`.
+
+### 기능 (Mac 1.2.0과 비교)
+
+| 기능 | Windows |
+|---|---|
+| 녹음 소스 선택: 마이크 / 시스템 / 둘 다 | ✅ 바꾸면 같은 파일에 이어 씀 |
+| 시스템 / 마이크 출처 표시 | ✅ 구간마다 더 크게 들린 쪽 |
+| 전사 따라가기 켜고 끄기 | ✅ |
+| 이전 녹음 기록 목록·다시 보기 | ✅ `문서\Talkit\transcript_*.txt` |
+| 미니창(PiP) | ✅ 항상 위, 최근 전사 이어 보기 (잠금은 아직) |
+| 일시정지·재개, 녹음 시간, 소리 크기 막대 | ✅ |
+| 문장 단위로 나눠 보기 | ✅ |
+| 끌어서 복사, 전체복사, 비우기 | ✅ 끌어서 복사하면 시각·출처 없이 문장만 |
+| TTS (전사 결과 읽기) | ✅ Windows 판에만 있음 |
+| 설치 파일 (Python 포함) | ❌ 아직 없음 — Python 설치 필요 |
+
+- 설정은 `%APPDATA%\Talkit\settings.txt`에 기억합니다 (입력, 따라가기, 자동 읽기, 항상 위).
+- 강의 소리 파일은 저장하지 않습니다. 전사된 글만 남습니다 (Mac 판과 같음).
+
+### TTS
+- 문장을 누르면 읽습니다. "자동 읽기"를 켜면 새 문장마다 읽고, "읽기 멈춤"으로 끊습니다.
+- 시스템 소리를 받는 중이면 TTS 소리도 녹음됩니다. 읽던 시간과 겹치고 내용이 비슷한(0.5 이상) 전사는 TTS 소리로 보고 버립니다 (`app/src/tts.rs`와 같은 규칙). 그동안 나온 강의 내용은 빠질 수 있습니다.
+
+### 백엔드 변경 (Windows / VAD 경로)
+- 마이크와 시스템 소리는 지금처럼 섞어서 한 번만 전사합니다 (스피커 소리가 마이크로 다시 잡혀 같은 말이 두 번 나오는 걸 막기 위해).
+- 대신 구간마다 어느 입력이 더 컸는지 보고 Mac 경로와 같은 모양으로 출처를 붙입니다: `{"type": "text", "text": "[시스템] 문장", "source": "시스템", …}`. txt에는 `[14:31:05] [시스템] 문장`.
+- 소리 크기 `{"type": "level", "rms": 0~1}`을 0.1초마다 보냅니다.
+
+### 확인한 것 (2026-11-06, Windows 11 + RTX 4070 Laptop)
+- 시험 wav 3문장 → 3문장 전사 (문장당 1.0~2.0초, cuda:0), txt 저장, 자동 읽기
+- 출처 판단: 가짜 두 입력(한쪽 음성, 한쪽 잡음)으로 6구간 모두 맞음
+- 읽기 멈춤, 끌어서 복사(시각·출처 빠짐) 정상
+- 실제 ZEP 강의 소리로 긴 시간 시험, 기록 화면·미니창·입력 전환은 직접 써 보며 확인 중
+
+> 참고: 위 "Windows + WSL2 구조"의 `gui_client.py`는 `live_transcribe.py`에서 tkinter 화면이 빠지면서 지금은 실행되지 않습니다. Windows에서는 `windows_app.py`를 쓰세요.
