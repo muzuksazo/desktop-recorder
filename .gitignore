@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
+.venv
 .venv/
 venv/
 transcript_*.txt
 .env
 target/
+dist/
+*.dmg
+macos_audio_tap

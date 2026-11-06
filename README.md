@@ -200,3 +200,91 @@ python live_transcribe.py
 ### 실행
 1. WSL: `bash scripts/run_backend.sh` → "GUI 접속 대기 중"이 나올 때까지 기다림 (첫 빌드는 몇 분)
 2. Windows: `python gui_client.py` (`--source system`, `--topmost` 등 사용 가능)
+
+---
+
+## Talkit Mac 앱 (DMG 설치 · 모델 위치)
+
+### 설치
+
+1. `Talkit-버전.dmg`를 열고 **Talkit**을 **응용 프로그램(Applications)** 폴더로 끌어다 놓습니다.
+2. 처음 열 때 "확인되지 않은 개발자"라며 막히면: 앱을 **우클릭 → 열기**, 또는 시스템 설정 → 개인정보 보호 및 보안 → **그래도 열기**.
+3. 녹음 권한을 허용합니다. (마이크 / 시스템 오디오 녹음)
+   나중에 바꾸려면: 시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 녹음 → **시스템 오디오 녹음만** 에서 Talkit 켜기.
+
+필요 조건: Apple Silicon(M1 이상), macOS 14.4 이상, 첫 실행 때 인터넷과 여유 공간 약 1.2GB.
+Python은 앱 안에 들어 있어서 따로 설치할 필요가 없습니다.
+
+### 모델 위치
+
+모델은 DMG에 들어 있지 않습니다. 처음 실행하면 자동으로 내려받습니다(약 1.1GB, 화면에 % 표시).
+
+| 무엇 | 위치 |
+|---|---|
+| 음성 인식 모델 | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit/` |
+| 설정 | `~/Library/Application Support/Talkit/settings.txt` |
+| 전사 기록 | `~/Documents/Talkit/transcript_YYYY-MM-DD_HHMM.txt` |
+
+- 모델 원본: Hugging Face [`yeowon/qwen3_asr_1.7b_ko-MLX-4bit`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-MLX-4bit) (공개)
+- 인터넷이 안 되는 Mac에는 다른 Mac에서 받아 위 폴더에 그대로 넣으면 됩니다. 폴더 안에 `model.safetensors`, `config.json` 등이 바로 있어야 합니다.
+  ```bash
+  hf download yeowon/qwen3_asr_1.7b_ko-MLX-4bit --local-dir "$HOME/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit"
+  ```
+- 모델 폴더를 다른 곳에 두려면 환경 변수 `TALKIT_MODELS_DIR`로 바꿀 수 있습니다.
+
+### DMG 만들기 (개발자)
+
+```bash
+packaging/package_macos.sh                      # 기본 버전
+VERSION=1.2.1 BUILD=8 packaging/package_macos.sh
+```
+
+- 외부 배포판(DMG)은 `edition.txt = public` 이 들어가 **공개 4-bit 모델만** 씁니다.
+- 비공개 엔진은 소스에서 실행하는 개발용 앱에서만 쓰며, 저장소와 DMG 어디에도 들어가지 않습니다.
+
+---
+
+## GPUI 앱 + Python 백엔드 (sangyun 브랜치)
+
+```
+[app/ Rust·GPUI 화면]  ──실행──▶  [backend.py Python]
+        ▲                          - 마이크·시스템 소리 녹음, Qwen3-ASR 전사 (live_transcribe.py 재사용)
+        └──── stdout JSON 한 줄씩 ──┘
+```
+
+### 백엔드 ↔ 앱 약속 (백엔드 팀과 맞출 부분)
+- 앱이 `python -X utf8 backend.py [옵션]`을 실행한다. 앱 실행 옵션은 그대로 백엔드에 넘어간다.
+- 백엔드는 stdout에 UTF-8 JSON을 한 줄씩 쓴다. 로그는 stderr로만 쓴다.
+  - `{"type": "status", "msg": "…"}` 상태
+  - `{"type": "text", "text": "[14:31:05] 전사된 문장"}` 전사 결과
+  - `{"type": "error", "msg": "…"}` 오류
+- `text` 줄에는 `clock`(표시용 시각), `start`/`end`(녹음 시각, Unix 초), `infer_sec`(전사 시간)도 들어간다.
+  앱은 `start`/`end`가 TTS 재생 구간과 겹치면 TTS 소리가 다시 잡힌 것으로 보고 버린다.
+- 앱 창을 닫으면 앱이 백엔드 프로세스를 끈다.
+- 주의(Windows): 백엔드에서 stdin을 읽으며 기다리면 torch import가 멈춘다. stdin은 쓰지 않는다.
+
+### 실행 (Windows)
+1. Visual Studio Build Tools(C++를 사용한 데스크톱 개발)와 Rust(rustup) 설치
+2. torch·qwen-asr·soundcard가 설치된 Python을 지정하고 실행:
+   ```powershell
+   $env:RECORDER_PYTHON = "C:\경로\.venv\Scripts\python.exe"
+   cd app
+   cargo run -- --model C:\경로\qwen3_asr_1.7b_ko --source both
+   ```
+   - `--source mic|system|both`, `--chunk 4`, `--out 경로.txt` 등은 `live_transcribe.py`와 같다.
+   - 첫 빌드는 4분쯤 걸린다.
+
+### 전사 방식 (속도·정확도)
+- **VAD 문장 단위**: Silero VAD로 말이 0.6초 끊기면 바로 전사한다. 고정 4초 단위보다 빨리 뜨고 단어 중간에서 안 잘린다.
+  15초 넘게 이어지면 마지막 3초 중 가장 조용한 곳에서 자른다.
+- 말 시작 전 0.3초를 같이 넣는다. 이 모델은 앞에 무음이 0.5초 이상 붙으면 첫 단어를 빼먹는다(시험 결과).
+- 언어는 한국어로 고정한다. 앞 문장은 문맥으로 넘기지 않는다(시험해 보니 더 틀림).
+  수업 용어는 `--context "GPUI, 러스트, 백엔드"`로 넘기면 도움이 된다.
+- Windows에서는 백엔드의 효율 모드(EcoQoS)를 끈다. 창 없는 프로세스라 CPU가 느려져 전사가 2배 느렸다.
+- 조절 옵션: `--pause 0.6`(문장 끝으로 볼 무음 초), `--max-seg 15`, `--vad 0.5`
+- 테스트: `--input-wav a.wav b.wav`로 녹음 대신 파일을 실시간 속도로 넣을 수 있다.
+
+### TTS (전사 결과 읽기)
+- Windows 기본 음성(SAPI)을 쓴다. 한국어 음성(Microsoft Heami)이 있으면 자동으로 고른다. 오프라인, 추가 설치 없음.
+- 문장을 누르면 읽는다. "자동 읽기"를 켜면 새 문장마다 읽는다. "읽기 멈춤"으로 끊는다.
+- 시스템 소리를 전사 중이면 TTS 소리도 녹음된다. 읽는 동안 들어온 소리는 버리므로, 그동안 나온 수업 내용은 빠질 수 있다.
