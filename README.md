@@ -177,6 +177,47 @@ python live_transcribe.py
 
 ---
 
+## Talkit Mac 앱 (DMG 설치 · 모델 위치)
+
+### 설치
+
+1. `Talkit-버전.dmg`를 열고 **Talkit**을 **응용 프로그램(Applications)** 폴더로 끌어다 놓습니다.
+2. 처음 열 때 "확인되지 않은 개발자"라며 막히면: 앱을 **우클릭 → 열기**, 또는 시스템 설정 → 개인정보 보호 및 보안 → **그래도 열기**.
+3. 녹음 권한을 허용합니다. (마이크 / 시스템 오디오 녹음)
+   나중에 바꾸려면: 시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 녹음 → **시스템 오디오 녹음만** 에서 Talkit 켜기.
+
+필요 조건: Apple Silicon(M1 이상), macOS 14.4 이상, 첫 실행 때 인터넷과 여유 공간 약 1.2GB.
+Python은 앱 안에 들어 있어서 따로 설치할 필요가 없습니다.
+
+### 모델 위치
+
+모델은 DMG에 들어 있지 않습니다. 처음 실행하면 자동으로 내려받습니다(약 1.1GB, 화면에 % 표시).
+
+| 무엇 | 위치 |
+|---|---|
+| 음성 인식 모델 | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit/` |
+| 설정 | `~/Library/Application Support/Talkit/settings.txt` |
+| 전사 기록 | `~/Documents/Talkit/transcript_YYYY-MM-DD_HHMM.txt` |
+
+- 모델 원본: Hugging Face [`yeowon/qwen3_asr_1.7b_ko-MLX-4bit`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-MLX-4bit) (공개)
+- 인터넷이 안 되는 Mac에는 다른 Mac에서 받아 위 폴더에 그대로 넣으면 됩니다. 폴더 안에 `model.safetensors`, `config.json` 등이 바로 있어야 합니다.
+  ```bash
+  hf download yeowon/qwen3_asr_1.7b_ko-MLX-4bit --local-dir "$HOME/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit"
+  ```
+- 모델 폴더를 다른 곳에 두려면 환경 변수 `TALKIT_MODELS_DIR`로 바꿀 수 있습니다.
+
+### DMG 만들기 (개발자)
+
+```bash
+packaging/package_macos.sh                      # 기본 버전
+VERSION=1.2.1 BUILD=8 packaging/package_macos.sh
+```
+
+- 외부 배포판(DMG)은 `edition.txt = public` 이 들어가 **공개 4-bit 모델만** 씁니다.
+- 비공개 엔진은 소스에서 실행하는 개발용 앱에서만 쓰며, 저장소와 DMG 어디에도 들어가지 않습니다.
+
+---
+
 ## GPUI 앱 + Python 백엔드 (sangyun 브랜치)
 
 ```
