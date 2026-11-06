@@ -25,10 +25,72 @@ use serde::Deserialize;
 // 모델
 // ---------------------------------------------------------------------------
 
-/// 공개 4-bit 모델 폴더 이름 (mlx_quantized_asr.resolve_model_dir 와 같은 규칙)
-pub const PUBLIC_MODEL_DIR: &str = "qwen3_asr_1.7b_ko-MLX-4bit";
 /// 다 받았다는 표시 파일 (mlx_quantized_asr.COMPLETE_MARKER 와 같아야 함)
 const COMPLETE_MARKER: &str = ".talkit-complete";
+
+/// 받을 수 있는 모델 하나 (backend.py 의 MODEL_REPOS 와 같은 id·폴더 이름)
+pub struct ModelSpec {
+    pub id: &'static str,
+    /// models 폴더 아래 이름 (= Hugging Face 저장소 이름)
+    pub dir: &'static str,
+    pub label: &'static str,
+    pub desc: &'static str,
+    pub approx: &'static str,
+    /// 개발용 Mac 의 예전 작업 폴더 이름 (외부 배포판은 보지 않음)
+    dev_dir: Option<&'static str>,
+}
+
+pub const MODELS: [ModelSpec; 4] = [
+    ModelSpec {
+        id: "public",
+        dir: "qwen3_asr_1.7b_ko-MLX-4bit",
+        label: "기본 모델",
+        desc: "Qwen3-ASR 1.7B 한국어 · 4-bit · 가장 가볍고 빠름",
+        approx: "1.1GB",
+        dev_dir: None,
+    },
+    ModelSpec {
+        id: "rung-omega",
+        dir: "qwen3_asr_1.7b_ko-RungOmega-MLX",
+        label: "Rung Ω",
+        desc: "정확도 우선 · 한국어 전용 출력층으로 빠르게",
+        approx: "2.5GB",
+        dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_g128_mlx"),
+    },
+    ModelSpec {
+        id: "rung-omega-lite",
+        dir: "qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
+        label: "Rung Ω 가벼운판",
+        desc: "Rung Ω 4-bit · 메모리를 적게 씀",
+        approx: "1.6GB",
+        dev_dir: Some("qwen3_asr_1_7b_ko_rung_omega_mac_mlx"),
+    },
+    ModelSpec {
+        id: "fa",
+        dir: "qwen3_forced_aligner_0.6b-RungOmega-MLX",
+        label: "문장 맞추기 (Forced Aligner)",
+        desc: "Rung Ω 와 함께 켜면 단어 시각을 맞춰 문장 끝 잘림·유령 단어를 줄임",
+        approx: "0.97GB",
+        dev_dir: Some("qwen3_forced_aligner_0_6b_rung_omega_mac_mlx"),
+    },
+];
+
+pub fn spec(id: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+/// 화면에서 고르는 항목: (id, 이름, 필요한 모델들)
+pub const CHOICES: [(&str, &str, &[&str]); 4] = [
+    ("public", "기본 모델", &["public"]),
+    ("rung-omega", "Rung Ω", &["rung-omega"]),
+    ("rung-omega-fa", "Rung Ω + 문장 맞추기", &["rung-omega", "fa"]),
+    ("rung-omega-lite", "Rung Ω 가벼운판", &["rung-omega-lite"]),
+];
+
+/// 고른 항목에 필요한 모델 id 들 (모르는 값·빈 값이면 기본 모델)
+pub fn required_models(choice: &str) -> &'static [&'static str] {
+    CHOICES.iter().find(|c| c.0 == choice).map(|c| c.2).unwrap_or(&["public"])
+}
 
 #[derive(Clone, PartialEq)]
 pub enum ModelState {
@@ -50,13 +112,34 @@ pub fn models_root() -> PathBuf {
     }
 }
 
-pub fn public_model_dir() -> PathBuf {
-    models_root().join(PUBLIC_MODEL_DIR)
+pub fn model_path(spec: &ModelSpec) -> PathBuf {
+    models_root().join(spec.dir)
 }
 
-/// 예전 개발용 위치 (있는 Mac 에서만 쓴다. 지우지 않는다)
-fn legacy_model_dir() -> PathBuf {
-    home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit")
+fn is_public_edition() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("../Resources/edition.txt")))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .is_some_and(|s| s.trim() == "public")
+}
+
+/// 개발용 Mac 에 이미 있는 같은 모델 (받지 않고 쓴다. 지우지 않는다)
+fn legacy_path(spec: &ModelSpec) -> Option<PathBuf> {
+    if spec.id == "public" {
+        return Some(home().join("qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit"));
+    }
+    if is_public_edition() {
+        return None;
+    }
+    let sub = spec.dev_dir?;
+    [
+        home().join("Library/Application Support/Talkit/engines/rung-omega/artifacts"),
+        home().join("qwen3-asr-ko/private_rung_omega_mac/artifacts"),
+    ]
+    .into_iter()
+    .map(|a| a.join(sub))
+    .find(|p| p.join("model.safetensors").exists())
 }
 
 fn has_incomplete(dir: &Path) -> bool {
@@ -96,21 +179,20 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
-pub fn scan_model() -> ModelState {
-    let dir = public_model_dir();
+pub fn scan_model(spec: &ModelSpec) -> ModelState {
+    let dir = model_path(spec);
     if is_complete(&dir) {
         return ModelState::Installed { bytes: dir_size(&dir), path: dir, legacy: false };
     }
-    let legacy = legacy_model_dir();
-    if legacy.join("model.safetensors").exists() {
+    if let Some(legacy) = legacy_path(spec).filter(|p| p.join("model.safetensors").exists()) {
         return ModelState::Installed { bytes: dir_size(&legacy), path: legacy, legacy: true };
     }
     ModelState::Missing { partial_bytes: dir_size(&dir) }
 }
 
-/// 받은 모델(또는 받다 만 조각)을 지운다. 예전 개발용 위치는 건드리지 않는다.
-pub fn delete_public_model() -> std::io::Result<()> {
-    let dir = public_model_dir();
+/// 받은 모델(또는 받다 만 조각)을 지운다. 개발용 예전 위치는 건드리지 않는다.
+pub fn delete_model(spec: &ModelSpec) -> std::io::Result<()> {
+    let dir = model_path(spec);
     if dir.exists() {
         fs::remove_dir_all(dir)?;
     }

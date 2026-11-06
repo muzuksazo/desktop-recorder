@@ -248,22 +248,32 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
              infer_sec=round(infer, 2), source=source)
 
 
-def private_engine_dirs():
-    """비공개 엔진 애드온을 찾는 곳 (있는 Mac 에서만 쓰인다. 코드는 저장소·DMG 에 넣지 않는다)."""
-    from pathlib import Path
-
-    dirs = []
-    env = os.environ.get("TALKIT_PRIVATE_ENGINE_DIR")
-    if env:
-        dirs.append(Path(env).expanduser())
-    dirs.append(Path.home() / "Library" / "Application Support" / "Talkit" / "engines" / "rung-omega")
-    dirs.append(Path.home() / "qwen3-asr-ko" / "private_rung_omega_mac")  # 예전 개발 위치
-    return dirs
+# ---------------------------------------------------------------- 모델 목록·받기·불러오기
+# 앱에서 고를 수 있는 음성 인식 모델. 모두 공개라서 로그인 없이 Hugging Face 에서 받는다.
+# 받은 모델은 ~/Library/Application Support/Talkit/models/<저장소 이름> 에 둔다 (앱의 updates.rs 와 같은 규칙).
+MODEL_REPOS = {
+    "public": "yeowon/qwen3_asr_1.7b_ko-MLX-4bit",
+    "rung-omega": "yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX",
+    "rung-omega-lite": "yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX-lite",
+    "fa": "yeowon/qwen3_forced_aligner_0.6b-RungOmega-MLX",  # 문장 맞추기 (Forced Aligner)
+}
+# 화면에서 고르는 항목: (id, 이름, 음성 인식 모델, 문장 맞추기 사용)
+CHOICES = [
+    ("public", "기본 모델", "public", False),
+    ("rung-omega", "Rung Ω", "rung-omega", False),
+    ("rung-omega-fa", "Rung Ω + 문장 맞추기", "rung-omega", True),
+    ("rung-omega-lite", "Rung Ω 가벼운판", "rung-omega-lite", False),
+]
+# 개발용 Mac: 받지 않았어도 예전 작업 폴더의 같은 가중치를 쓴다 (외부 배포판은 보지 않음)
+_DEV_ARTIFACTS = {
+    "rung-omega": "qwen3_asr_1_7b_ko_rung_omega_g128_mlx",
+    "rung-omega-lite": "qwen3_asr_1_7b_ko_rung_omega_mac_mlx",
+    "fa": "qwen3_forced_aligner_0_6b_rung_omega_mac_mlx",
+}
 
 
 def is_public_edition():
-    """외부 배포판이면 True. 패키징 스크립트가 앱 안에 edition.txt(public)를 넣는다.
-    배포판은 그 Mac 에 비공개 엔진 폴더가 있어도 쓰지 않고 공개 4-bit 모델만 쓴다."""
+    """외부 배포판(DMG)이면 True. 패키징 스크립트가 앱 안에 edition.txt(public)를 넣는다."""
     from pathlib import Path
 
     f = Path(__file__).resolve().parent / "edition.txt"
@@ -273,89 +283,90 @@ def is_public_edition():
         return False
 
 
-def _find_private_root():
+def _dev_artifacts_dir():
+    from pathlib import Path
+
     if is_public_edition():
         return None
-    for root in private_engine_dirs():
-        if (root / "qwen3_asr_rung_omega_mac.py").is_file() and (root / "artifacts").is_dir():
-            return root
+    for root in (
+        Path.home() / "Library" / "Application Support" / "Talkit" / "engines" / "rung-omega",
+        Path.home() / "qwen3-asr-ko" / "private_rung_omega_mac",
+    ):
+        if (root / "artifacts").is_dir():
+            return root / "artifacts"
     return None
 
 
-# 고를 수 있는 모델: (id, 화면 이름, artifacts 아래 폴더, 문장 맞추기(FA) 사용)
-_PRIVATE_VARIANTS = [
-    ("rung-omega", "Rung Ω", "qwen3_asr_1_7b_ko_rung_omega_g128_mlx", False),
-    ("rung-omega-fa", "Rung Ω + 문장 맞추기", "qwen3_asr_1_7b_ko_rung_omega_g128_mlx", True),
-    ("rung-omega-lite", "Rung Ω 가벼운판", "qwen3_asr_1_7b_ko_rung_omega_mac_mlx", False),
-]
-_FA_DIR = "qwen3_forced_aligner_0_6b_rung_omega_mac_mlx"
+def model_dir(mid):
+    """받아 둔 모델 폴더 (없으면 None)"""
+    import mlx_quantized_asr as mqa
+
+    repo = MODEL_REPOS[mid]
+    target = mqa.talkit_models_dir() / repo.split("/")[-1]
+    if mqa.model_is_complete(target):
+        return target
+    if mid == "public":
+        legacy = mqa.Path.home() / "qwen3-asr-ko" / "qwen3_asr_1.7b_ko_mlx_4bit"
+        return legacy if (legacy / "model.safetensors").exists() else None
+    art = _dev_artifacts_dir()
+    if art is not None and (art / _DEV_ARTIFACTS[mid] / "model.safetensors").exists():
+        return art / _DEV_ARTIFACTS[mid]
+    return None
 
 
 def list_models():
-    """이 Mac 에서 쓸 수 있는 모델 목록. 공개 모델은 늘 있고, 비공개 애드온이 있으면 Rung Ω 가 추가된다."""
-    items = [{"id": "public", "label": "기본 모델"}]
-    root = _find_private_root()
-    if root is not None:
-        art = root / "artifacts"
-        for mid, label, sub, fa in _PRIVATE_VARIANTS:
-            if not (art / sub / "model.safetensors").exists():
-                continue
-            if fa and not (art / _FA_DIR / "model.safetensors").exists():
-                continue
-            items.append({"id": mid, "label": label})
-    return items, root
+    """고를 수 있는 모델 전부와 이 Mac 에 받아 뒀는지"""
+    items = []
+    for cid, label, asr, fa in CHOICES:
+        installed = model_dir(asr) is not None and (not fa or model_dir("fa") is not None)
+        items.append({"id": cid, "label": label, "installed": installed})
+    return items
 
 
-def default_model_choice(items):
-    ids = [i["id"] for i in items]
-    # 비공개 엔진이 있으면 Rung Ω(문장 맞추기 없이: 결과는 같고 메모리 0.9GB 절약, 2026-11-06 측정)
-    return "rung-omega" if "rung-omega" in ids else "public"
-
-
-def _install_private_engine(lt, choice, root):
-    """고른 Rung Ω 판으로 모델 로더를 바꾼다. 실패하면 공개 모델로 계속 동작."""
+def _install_rung_engine(lt, choice, emit):
+    """고른 Rung Ω 구성으로 모델 로더를 바꾼다. 모델이 없거나 실패하면 False (기본 모델로 계속)."""
     import sys
-    from pathlib import Path
 
-    variant = next((v for v in _PRIVATE_VARIANTS if v[0] == choice), None)
-    if variant is None or root is None:
+    entry = next((c for c in CHOICES if c[0] == choice), None)
+    if entry is None or entry[2] == "public":
         return False
-    _, label, sub, use_fa = variant
+    _, label, asr, use_fa = entry
+    asr_dir = model_dir(asr)
+    fa_dir = model_dir("fa") if use_fa else None
+    if asr_dir is None or (use_fa and fa_dir is None):
+        emit(type="error", msg=f"'{label}' 모델을 아직 받지 않았어요. 모델 화면에서 받은 뒤 다시 골라 주세요. 지금은 기본 모델로 전사합니다.")
+        return False
     try:
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
         import mlx.core as mx
-        import qwen3_asr_rung_omega_mac as omega
+        import rung_runtime
 
-        model_dir = root / "artifacts" / sub
-        if not use_fa:
-            # FA 폴더를 못 찾게 해서 문장 맞추기 모델(0.9GB)을 아예 올리지 않는다
-            omega.FA_OMEGA_DIR = Path("/nonexistent-talkit-fa")
-
-        def _load_private(device_arg, model_id, mlx_4bit=True):
+        def _load_rung(device_arg, model_id, mlx_4bit=True):
             mx.set_cache_limit(128 * 1024 * 1024)
-            engine = omega.MacTheoremFlowOmegaASREngine.from_omega_dir(model_dir)
+            engine = rung_runtime.MacTheoremFlowOmegaASREngine.from_omega_dir(asr_dir, fa_dir=fa_dir)
             # 이 이름은 live_transcribe 가 'mlx' 로 시작하는지로 실시간 스트리밍 방식을 고르는 데 쓴다.
             # 화면용 이름(label)을 넣으면 옛 덩어리 방식으로 빠져 '.transcribe 없음' 오류가 난다(2026-11-06).
             return engine, f"mlx-{choice}"
 
-        lt.load_model = _load_private
-        sys.stderr.write(f"[Talkit] 비공개 엔진 사용: {label} ({model_dir})\n")
+        lt.load_model = _load_rung
+        sys.stderr.write(f"[Talkit] {label} 사용: {asr_dir}{' + ' + str(fa_dir) if fa_dir else ''}\n")
         return True
-    except Exception as e:  # 애드온이 깨져도 앱은 공개 모델로 계속 동작
-        sys.stderr.write(f"[Talkit] 비공개 엔진을 쓸 수 없어 기본 모델 사용: {e}\n")
+    except Exception as e:  # 깨진 모델이어도 앱은 기본 모델로 계속 동작
+        emit(type="error", msg=f"'{label}' 을 불러오지 못해 기본 모델로 전사합니다: {e}")
         return False
 
 
-def download_model_only(emit):
-    """앱의 '모델 관리' 화면용: 공개 4-bit 모델만 내려받고 끝낸다 (녹음·전사는 하지 않음).
+def download_model_only(emit, mid):
+    """앱의 '모델' 화면용: 모델 하나만 내려받고 끝낸다 (녹음·전사는 하지 않음).
     보내는 줄: download(진행) → download_done(끝) 또는 error(실패)."""
     import mlx_quantized_asr as mqa
 
+    if mid not in MODEL_REPOS:
+        emit(type="error", msg=f"모르는 모델: {mid}")
+        return 1
     mqa.PROGRESS_HOOK = None
     mqa.DOWNLOAD_HOOK = lambda got, total: emit(type="download", got=int(got), total=int(total) if total else None)
     try:
-        path = mqa.resolve_model_dir(mqa.DEFAULT_MLX_4BIT_MODEL)
+        path = mqa.resolve_model_dir(MODEL_REPOS[mid])
     except Exception as e:  # 인터넷 끊김·용량 부족 등: 그대로 화면에 보여 준다
         emit(type="error", msg=f"{e}")
         return 1
@@ -366,7 +377,9 @@ def download_model_only(emit):
 def main():
     emit = Emitter()
     if "--download-model" in sys.argv[1:]:
-        return download_model_only(emit)
+        i = sys.argv.index("--download-model")
+        nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        return download_model_only(emit, nxt if nxt and not nxt.startswith("-") else "public")
     boosted = boost_process_windows()
 
     import live_transcribe as lt
@@ -391,10 +404,10 @@ def main():
     args, _ = p.parse_known_args()
 
     # 쓸 수 있는 모델을 앱에 알려 주고, 고른 모델을 준비한다
-    models, private_root = list_models()
+    models = list_models()
     ids = [m["id"] for m in models]
-    choice = args.model_choice if args.model_choice in ids else default_model_choice(models)
-    if choice != "public" and not _install_private_engine(lt, choice, private_root):
+    choice = args.model_choice if args.model_choice in ids else "public"
+    if choice != "public" and not _install_rung_engine(lt, choice, emit):
         choice = "public"
     emit(type="models", items=models, current=choice)
     args.language = args.language or None
