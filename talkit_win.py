@@ -15,7 +15,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import urllib.request
@@ -203,16 +202,19 @@ def sync_app_files():
     if not FROZEN:
         return
     os.makedirs(APP_DIR, exist_ok=True)
-    stamp = os.path.join(APP_DIR, "version.txt")
-    try:
-        with open(stamp, encoding="utf-8") as f:
-            if f.read().strip() == APP_VERSION and all(os.path.exists(os.path.join(APP_DIR, n)) for n in APP_FILES):
-                return
-    except OSError:
-        pass
-    for n in APP_FILES:
-        shutil.copy2(os.path.join(BUNDLE, "payload", n), os.path.join(APP_DIR, n))
-    with open(stamp, "w", encoding="utf-8") as f:
+    for n in APP_FILES:  # 내용이 다를 때만 바꾼다 (같은 버전 번호로 고친 파일도 반영되게)
+        src, dst = os.path.join(BUNDLE, "payload", n), os.path.join(APP_DIR, n)
+        with open(src, "rb") as f:
+            new = f.read()
+        try:
+            with open(dst, "rb") as f:
+                if f.read() == new:
+                    continue
+        except OSError:
+            pass
+        with open(dst, "wb") as f:
+            f.write(new)
+    with open(os.path.join(APP_DIR, "version.txt"), "w", encoding="utf-8") as f:
         f.write(APP_VERSION)
 
 

@@ -299,7 +299,10 @@ def _dev_artifacts_dir():
 
 def model_dir(mid):
     """받아 둔 모델 폴더 (없으면 None)"""
-    import mlx_quantized_asr as mqa
+    try:
+        import mlx_quantized_asr as mqa
+    except ImportError:  # Windows 등 MLX 가 없는 PC: 이 목록의 모델(MLX 형식)은 쓸 수 없다
+        return None
 
     repo = MODEL_REPOS[mid]
     target = mqa.talkit_models_dir() / repo.split("/")[-1]
