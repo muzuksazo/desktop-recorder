@@ -36,6 +36,20 @@ MAX_STREAMING_AUDIO_WINDOW_SEC = 24.0
 
 # 모델 내려받기 진행 상황을 앱 화면에 보내는 함수 (live_transcribe.Transcriber 가 넣어 준다)
 PROGRESS_HOOK = None
+# 진행 막대용: (받은 바이트, 전체 바이트 또는 None) 을 받는 함수 (backend.py --download-model 이 넣어 준다)
+DOWNLOAD_HOOK = None
+# 내려받기가 끝까지 됐다는 표시. 중간에 끊긴 폴더를 '설치됨'으로 착각하지 않게 한다 (앱도 이 파일을 본다)
+COMPLETE_MARKER = ".talkit-complete"
+
+
+def model_is_complete(folder: Path) -> bool:
+    """모델 폴더가 다 받아진 상태인지. 표시 파일이 있거나, 표시가 생기기 전 버전으로 다 받은 폴더면 True."""
+    if (folder / COMPLETE_MARKER).exists():
+        return True
+    if not ((folder / "model.safetensors").exists() and (folder / "config.json").exists()):
+        return False
+    # 표시 파일이 없는 예전 설치: 받다 만 조각(.incomplete)이 남아 있지 않으면 다 받은 것으로 본다
+    return not any((folder / ".cache").rglob("*.incomplete"))
 
 
 def _report(msg: str) -> None:
@@ -59,7 +73,7 @@ def talkit_models_dir() -> Path:
 def resolve_model_dir(repo_id: str) -> Path:
     """모델 폴더를 찾고, 없으면 처음 한 번만 Hugging Face 에서 내려받는다(진행률 표시)."""
     target = talkit_models_dir() / repo_id.split("/")[-1]
-    if (target / "model.safetensors").exists() and (target / "config.json").exists():
+    if model_is_complete(target):
         return target
     # 예전 개발용 위치(있는 Mac 에서만): 다시 내려받지 않는다
     legacy = Path.home() / "qwen3-asr-ko" / "qwen3_asr_1.7b_ko_mlx_4bit"
@@ -89,17 +103,23 @@ def resolve_model_dir(repo_id: str) -> Path:
 
     threading.Thread(target=_download, daemon=True).start()
     _report("음성 인식 모델을 처음 한 번 내려받는 중… (약 1.1GB)")
-    while not done.wait(2.0):
+    while not done.wait(1.0):
         got = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+        if DOWNLOAD_HOOK is not None:
+            try:
+                DOWNLOAD_HOOK(got, total)
+            except Exception:
+                pass
         if total:
             pct = min(99, int(got * 100 / total))
             _report(f"모델 내려받는 중… {pct}% ({got // 2**20}/{total // 2**20}MB, 처음 한 번만)")
         else:
             _report(f"모델 내려받는 중… {got // 2**20}MB (처음 한 번만)")
     if errors:
-        raise RuntimeError(f"모델을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 켜 주세요. ({errors[0]})")
+        raise RuntimeError(f"모델을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 시도해 주세요. ({errors[0]})")
     if not (target / "model.safetensors").exists():
         raise RuntimeError(f"모델 파일이 없습니다: {target}")
+    (target / COMPLETE_MARKER).write_text(repo_id + "\n")
     _report("모델 준비 완료")
     return target
 

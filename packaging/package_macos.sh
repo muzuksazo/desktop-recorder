@@ -13,6 +13,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# 앱이 지원하는 가장 낮은 macOS (Core Audio Process Tap 이 14.4 부터). 패키지도 이 버전용으로 받는다.
+MIN_MACOS="14.4"
+export MACOSX_DEPLOYMENT_TARGET="14.0"
 VERSION="${VERSION:-1.2.0}"
 BUILD="${BUILD:-6}"
 PY_VER="${PY_VER:-3.11}"
@@ -38,7 +41,7 @@ echo "▶ 앱 빌드"
 cp "$ROOT/app/target/release/recorder-app" "$C/MacOS/Talkit"
 
 echo "▶ 시스템 오디오 도우미 빌드"
-swiftc -O -parse-as-library "$ROOT/macos_audio_tap.swift" -o "$C/Resources/macos_audio_tap"
+swiftc -O -parse-as-library -target "arm64-apple-macos$MIN_MACOS" "$ROOT/macos_audio_tap.swift" -o "$C/Resources/macos_audio_tap"
 
 cp "$ROOT/backend.py" "$ROOT/live_transcribe.py" "$ROOT/mlx_quantized_asr.py" "$C/Resources/"
 # 외부 배포판 표시: 공개 4-bit 모델만 쓴다 (비공개 Rung Ω 애드온이 있는 Mac 이어도 무시)
@@ -60,7 +63,11 @@ if find "$C/Resources/python" -type l -exec readlink {} \; | grep -q '^/'; then
   exit 1
 fi
 BUNDLED_PY="$C/Resources/python/bin/python3"
+# 꼭 '앱이 지원하는 가장 낮은 macOS' 용 패키지를 받는다. 그냥 받으면 빌드하는 Mac 의 macOS 용
+# (예: mlx macosx_26_0) 이 들어가, 그보다 낮은 macOS 에서 MLX 가 안 열리고 'No module named torch' 로
+# 엉뚱하게 실패한다(2026-11-06 실제로 발생).
 uv pip install --quiet --python "$BUNDLED_PY" --break-system-packages \
+  --python-platform aarch64-apple-darwin \
   -r "$ROOT/packaging/requirements-macos.txt"
 
 echo "▶ 필요 없는 파일 정리"
@@ -70,6 +77,23 @@ rm -rf "$LIB/test" "$LIB/idlelib" "$LIB/tkinter" "$LIB/turtledemo" "$LIB/ensurep
        "$C/Resources/python/share" "$C/Resources/python/include"
 find "$C/Resources/python" -name "__pycache__" -type d -prune -exec rm -rf {} +
 find "$C/Resources/python" -type d -name "tests" -path "*site-packages*" -prune -exec rm -rf {} +
+
+echo "▶ 낮은 macOS 에서도 열리는지 확인 (모든 실행 파일·라이브러리의 최소 macOS ≤ $MIN_MACOS)"
+too_new="$(find "$C" -type f \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) -print0 |
+  while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q "Mach-O" || continue
+    v="$(vtool -show-build "$f" 2>/dev/null | awk '/minos/{print $2; exit}')"
+    [ -n "$v" ] || continue
+    if [ "$(printf '%s\n%s\n' "$v" "$MIN_MACOS" | sort -V | tail -1)" != "$MIN_MACOS" ]; then
+      echo "  ${f#$C/} (macOS $v 이상 필요)"
+    fi
+  done)"
+if [ -n "$too_new" ]; then
+  echo "✗ 이 파일들은 macOS $MIN_MACOS 에서 열리지 않습니다:" >&2
+  echo "$too_new" | head -20 >&2
+  exit 1
+fi
+echo "  OK"
 
 echo "▶ 앱이 쓰는 모듈이 실제로 불러와지는지 확인"
 # -E -s: 이 Mac 의 환경 변수·사용자 패키지를 무시하고 앱 안의 것만으로 불러온다
@@ -92,7 +116,7 @@ cat > "$C/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD</string>
   <key>CFBundleDevelopmentRegion</key><string>ko</string>
-  <key>LSMinimumSystemVersion</key><string>14.4</string>
+  <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Talkit이 실시간 한국어 음성 인식을 위해 마이크에 접근합니다.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Talkit이 실시간 시스템 소리 전사를 위해 오디오 캡처에 접근합니다.</string>
@@ -121,9 +145,9 @@ find "$C/Resources" -type f \( -name "*.so" -o -name "*.dylib" -o -perm -u+x \) 
     kind="$(file -b "$f")"
     if echo "$kind" | grep -q "Mach-O"; then
       if echo "$kind" | grep -q "executable"; then
-        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" --entitlements "$ENT" "$f" >/dev/null
+        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" --entitlements "$ENT" "$f" 2>/dev/null
       else
-        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" "$f" >/dev/null
+        codesign "${SIGN_OPTS[@]}" -s "$SIGN_ID" "$f" 2>/dev/null
       fi
     fi
   done
