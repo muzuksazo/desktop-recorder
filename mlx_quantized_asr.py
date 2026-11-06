@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +33,75 @@ DEFAULT_MLX_4BIT_MODEL = "yeowon/qwen3_asr_1.7b_ko-MLX-4bit"
 MLX_CACHE_LIMIT_BYTES = 128 * 1024 * 1024
 # Maximum rolling audio window (seconds) fed to the encoder per streaming utterance
 MAX_STREAMING_AUDIO_WINDOW_SEC = 24.0
+
+# 모델 내려받기 진행 상황을 앱 화면에 보내는 함수 (live_transcribe.Transcriber 가 넣어 준다)
+PROGRESS_HOOK = None
+
+
+def _report(msg: str) -> None:
+    print(msg, flush=True)
+    hook = PROGRESS_HOOK
+    if hook is not None:
+        try:
+            hook(msg)
+        except Exception:
+            pass
+
+
+def talkit_models_dir() -> Path:
+    """모델을 두는 곳. 어느 Mac 에서든 같은 규칙: ~/Library/Application Support/Talkit/models"""
+    env = os.environ.get("TALKIT_MODELS_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / "Library" / "Application Support" / "Talkit" / "models"
+
+
+def resolve_model_dir(repo_id: str) -> Path:
+    """모델 폴더를 찾고, 없으면 처음 한 번만 Hugging Face 에서 내려받는다(진행률 표시)."""
+    target = talkit_models_dir() / repo_id.split("/")[-1]
+    if (target / "model.safetensors").exists() and (target / "config.json").exists():
+        return target
+    # 예전 개발용 위치(있는 Mac 에서만): 다시 내려받지 않는다
+    legacy = Path.home() / "qwen3-asr-ko" / "qwen3_asr_1.7b_ko_mlx_4bit"
+    if repo_id == DEFAULT_MLX_4BIT_MODEL and (legacy / "model.safetensors").exists():
+        return legacy
+
+    total = None
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id, files_metadata=True)
+        total = sum((s.size or 0) for s in (info.siblings or [])) or None
+    except Exception:
+        pass
+
+    target.mkdir(parents=True, exist_ok=True)
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def _download() -> None:
+        try:
+            snapshot_download(repo_id=repo_id, local_dir=str(target))
+        except BaseException as e:  # noqa: BLE001 - 받은 오류를 그대로 사용자에게 보여 준다
+            errors.append(e)
+        finally:
+            done.set()
+
+    threading.Thread(target=_download, daemon=True).start()
+    _report("음성 인식 모델을 처음 한 번 내려받는 중… (약 1.1GB)")
+    while not done.wait(2.0):
+        got = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+        if total:
+            pct = min(99, int(got * 100 / total))
+            _report(f"모델 내려받는 중… {pct}% ({got // 2**20}/{total // 2**20}MB, 처음 한 번만)")
+        else:
+            _report(f"모델 내려받는 중… {got // 2**20}MB (처음 한 번만)")
+    if errors:
+        raise RuntimeError(f"모델을 내려받지 못했어요. 인터넷 연결을 확인한 뒤 다시 켜 주세요. ({errors[0]})")
+    if not (target / "model.safetensors").exists():
+        raise RuntimeError(f"모델 파일이 없습니다: {target}")
+    _report("모델 준비 완료")
+    return target
 
 
 class QuantizableTextDecoder(TextDecoder):
@@ -119,12 +189,8 @@ class QuantizedMLXQwen3ASR:
     ) -> None:
         t0 = time.time()
         path = Path(model_id_or_path)
-        local_cached = Path("/Users/yun-yeowon/qwen3-asr-ko/qwen3_asr_1.7b_ko_mlx_4bit")
         if not path.is_dir():
-            if str(model_id_or_path) == DEFAULT_MLX_4BIT_MODEL and (local_cached / "model.safetensors").exists():
-                path = local_cached
-            else:
-                path = Path(snapshot_download(repo_id=str(model_id_or_path)))
+            path = resolve_model_dir(str(model_id_or_path))
 
         self.model_path = path
         self.bits = bits

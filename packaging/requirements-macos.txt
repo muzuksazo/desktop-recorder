@@ -1,0 +1,10 @@
+# Talkit.app 안에 넣는 Python 패키지 (Apple Silicon, MLX 스트리밍 경로에 필요한 것만).
+# torch·qwen-asr·silero-vad 는 Windows/VAD 경로 전용이라 넣지 않는다.
+# 버전은 2026-11-06 실제로 잘 돌던 개발 환경(.venv)과 같게 고정.
+mlx==0.32.4
+qwen3-asr-mlx==0.3.0
+numpy==2.4.6
+SoundCard==0.4.6
+soundfile==0.14.0
+# huggingface_hub 도 qwen3-asr-mlx 가 요구하는 버전(>=1.0)을 따른다
+# tokenizers 는 qwen3-asr-mlx 가 요구하는 버전(>=0.23)을 따른다 (.venv 의 0.22.2 는 transformers 때문에 묶인 것)

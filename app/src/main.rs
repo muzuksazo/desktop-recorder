@@ -655,16 +655,42 @@ enum Event {
     Exited,
 }
 
+/// 백엔드를 띄울 Python 을 고른다. 어느 Mac 에서든 동작하도록 사용자 이름이 박힌 경로는 쓰지 않는다.
+/// 1) RECORDER_PYTHON (개발용)
+/// 2) 비공개 엔진 애드온 폴더의 python-path.txt (그 엔진은 torch 가 필요해 자기 Python 을 쓴다)
+/// 3) 앱 안에 넣은 Python (Contents/Resources/python) — 배포된 앱의 기본
+/// 4) 소스에서 실행할 때의 .venv
 fn resolve_python_bin() -> PathBuf {
     if let Some(p) = env::var_os("RECORDER_PYTHON") {
         return PathBuf::from(p);
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let addon_dirs = [
+            home.join("Library/Application Support/Talkit/engines/rung-omega"),
+            home.join("qwen3-asr-ko/private_rung_omega_mac"),
+        ];
+        for dir in addon_dirs {
+            if let Ok(text) = std::fs::read_to_string(dir.join("python-path.txt")) {
+                let p = PathBuf::from(text.trim());
+                if p.exists() {
+                    return p;
+                }
+            }
+        }
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            let bundled = macos_dir.join("../Resources/python/bin/python3");
+            if bundled.exists() {
+                return bundled;
+            }
+        }
     }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     let candidates = [
         root.join(".venv").join("bin").join("python"),
         root.join(".venv").join("Scripts").join("python.exe"),
-        PathBuf::from("/Users/yun-yeowon/qwen3-asr-ko/.venv/bin/python"),
-        PathBuf::from("/Users/yun-yeowon/desktop-recorder/.venv/bin/python"),
         PathBuf::from("/opt/homebrew/bin/python3"),
         PathBuf::from("python3"),
         PathBuf::from("python"),

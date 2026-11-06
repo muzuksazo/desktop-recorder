@@ -493,6 +493,13 @@ class Transcriber(threading.Thread):
 
     def run(self):
         args = self.args
+        # 첫 실행에 모델을 내려받는 동안 진행률(%)을 앱 상태 줄에 보여 준다
+        try:
+            import mlx_quantized_asr as _mqa
+
+            _mqa.PROGRESS_HOOK = lambda msg: self.ui_q.put(("status", msg))
+        except Exception:
+            pass
         try:
             model, dev = load_model(args.device, getattr(args, "model", None))
         except Exception as e:

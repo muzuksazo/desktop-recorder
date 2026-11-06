@@ -217,11 +217,59 @@ def transcribe_loop(args, model, seg_q, emit, stop, out_path):
              infer_sec=round(infer, 2))
 
 
+def private_engine_dirs():
+    """비공개 엔진 애드온을 찾는 곳 (있는 Mac 에서만 쓰인다. 코드는 저장소·DMG 에 넣지 않는다)."""
+    from pathlib import Path
+
+    dirs = []
+    env = os.environ.get("TALKIT_PRIVATE_ENGINE_DIR")
+    if env:
+        dirs.append(Path(env).expanduser())
+    dirs.append(Path.home() / "Library" / "Application Support" / "Talkit" / "engines" / "rung-omega")
+    dirs.append(Path.home() / "qwen3-asr-ko" / "private_rung_omega_mac")  # 예전 개발 위치
+    return dirs
+
+
+def _install_private_engine(lt, emit):
+    """Rung Ω 같은 비공개 엔진 애드온이 있으면 모델 로더를 그것으로 바꾼다. 없거나 실패하면 공개 4-bit 모델.
+
+    애드온 폴더에는 qwen3_asr_rung_omega_mac.py 와 artifacts/ 가 있다. 이 엔진은 torch 가 필요해서,
+    앱(Talkit.app)은 애드온 폴더의 python-path.txt 에 적힌 Python 으로 백엔드를 띄운다(main.rs).
+    """
+    import sys
+
+    for root in private_engine_dirs():
+        if not (root / "qwen3_asr_rung_omega_mac.py").is_file():
+            continue
+        try:
+            if str(root) not in sys.path:
+                sys.path.insert(0, str(root))
+            import mlx.core as mx
+            from qwen3_asr_rung_omega_mac import MacTheoremFlowOmegaASREngine, MLX_OMEGA_DIR
+
+            g128 = MLX_OMEGA_DIR.parent / "qwen3_asr_1_7b_ko_rung_omega_g128_mlx"
+
+            def _load_private(device_arg, model_id, mlx_4bit=True):
+                mx.set_cache_limit(128 * 1024 * 1024)
+                engine = MacTheoremFlowOmegaASREngine.from_omega_dir(g128 if g128.exists() else MLX_OMEGA_DIR)
+                tag = "mlx-rung-omega-4trit+FA" if engine.forced_aligner is not None else "mlx-rung-omega"
+                return engine, tag
+
+            lt.load_model = _load_private
+            sys.stderr.write(f"[Talkit] 비공개 엔진 사용: {root}\n")
+            return
+        except Exception as e:  # 애드온이 깨져도 앱은 공개 모델로 계속 동작
+            sys.stderr.write(f"[Talkit] 비공개 엔진을 쓸 수 없어 공개 4-bit 모델 사용: {e}\n")
+            return
+
+
 def main():
     emit = Emitter()
     boosted = boost_process_windows()
 
     import live_transcribe as lt
+
+    _install_private_engine(lt, emit)
 
     p = argparse.ArgumentParser(description="전사 백엔드 (GPUI 앱용, 화면 없음)")
     p.add_argument("--model", default=lt.MODEL_ID, help="모델 폴더 경로 또는 HF 모델 ID")
