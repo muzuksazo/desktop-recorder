@@ -240,14 +240,20 @@ def _is_text_echo_of_system(mic_text: str, sys_texts: list[str]) -> bool:
     return False
 
 
+# MLX 를 못 불러온 진짜 이유 (torch 쪽으로 넘어가 'No module named torch' 로 가려지지 않게 보관)
+_MLX_ERROR = None
+
+
 def _has_mlx() -> bool:
+    global _MLX_ERROR
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         return False
     try:
         import mlx.core  # noqa: F401
         import qwen3_asr_mlx  # noqa: F401
         return True
-    except Exception:
+    except Exception as e:
+        _MLX_ERROR = e
         return False
 
 
@@ -417,7 +423,18 @@ def pick_device(requested):
     if requested == "mlx" or (requested == "auto" and _has_mlx()):
         return "mlx", "int4"
 
-    import torch
+    try:
+        import torch
+    except ImportError:
+        # Mac 앱(DMG)에는 torch 가 없다. Apple Silicon 에서 여기까지 왔다면 MLX 가 안 열린 것이다.
+        if _MLX_ERROR is not None:
+            raise RuntimeError(
+                f"음성 인식 엔진(MLX)을 열지 못했어요. macOS 14.4 이상이 필요하고, 이미 그 이상이면 최신 Talkit 을 다시 설치해 주세요. "
+                f"(macOS {platform.mac_ver()[0]}, 원인: {_MLX_ERROR})"
+            ) from None
+        raise RuntimeError(
+            "이 컴퓨터에서 쓸 음성 인식 엔진이 없어요. Talkit Mac 앱은 Apple Silicon(M1 이상) Mac 전용입니다."
+        ) from None
 
     if requested != "auto":
         dev = requested
