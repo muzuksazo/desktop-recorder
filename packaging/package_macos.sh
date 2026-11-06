@@ -4,20 +4,20 @@
 #   - 모델은 넣지 않는다. 첫 실행 때 ~/Library/Application Support/Talkit/models 로 내려받는다(약 1.1GB)
 #   - 사용자 이름이 들어간 경로를 쓰지 않는다
 #
-# 사용:  packaging/package_macos.sh                 (버전 1.2.0)
-#        VERSION=1.2.1 BUILD=7 packaging/package_macos.sh
+# 사용:  packaging/package_macos.sh                 (버전 1.4.0)
+#        VERSION=1.4.0 BUILD=10 packaging/package_macos.sh
 #        SIGN_ID="-" packaging/package_macos.sh      (서명 인증서 없이 ad-hoc)
 #
-# 외부 배포판은 공개 4-bit 모델만 쓴다(edition.txt = public). 비공개 Rung Ω 엔진은 넣지도, 찾지도 않는다.
-# Rung Ω 는 소스에서 실행하는 개발용 앱에서만 쓸 수 있다(애드온 폴더 + python-path.txt).
+# 외부 배포판(edition.txt = public)은 공개 Hugging Face 모델 4종(기본 4-bit / Rung Ω / Rung Ω 가벼운판 / 문장 맞추기)을
+# 로그인 없이 내려받아 쓰며, 이 Mac 의 개발용 작업 폴더는 참조하지 않는다.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 앱이 지원하는 가장 낮은 macOS (Core Audio Process Tap 이 14.4 부터). 패키지도 이 버전용으로 받는다.
 MIN_MACOS="14.4"
 export MACOSX_DEPLOYMENT_TARGET="14.0"
-VERSION="${VERSION:-1.2.0}"
-BUILD="${BUILD:-6}"
+VERSION="${VERSION:-1.4.0}"
+BUILD="${BUILD:-10}"
 PY_VER="${PY_VER:-3.11}"
 BUNDLE_ID="com.talkit.app"
 STAGE="$ROOT/dist/stage-$VERSION"

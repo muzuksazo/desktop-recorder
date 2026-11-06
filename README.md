@@ -224,30 +224,36 @@ python live_transcribe.py
 필요 조건: Apple Silicon(M1 이상), macOS 14.4 이상, 첫 실행 때 인터넷과 여유 공간 약 1.2GB.
 Python은 앱 안에 들어 있어서 따로 설치할 필요가 없습니다.
 
-### 모델 위치
+### 모델 위치 · 선택 가능한 모델 (1.4.0부터)
 
-모델은 DMG에 들어 있지 않습니다. 처음 실행하면 자동으로 내려받습니다(약 1.1GB, 화면에 % 표시).
+모델은 DMG에 들어 있지 않습니다. 처음 실행하면 기본 모델(약 1.1GB)을 자동으로 내려받으며, 위쪽 **모델** 화면에서 4종 모델을 로그인 없이 내려받고 골라 쓸 수 있습니다.
 
-| 무엇 | 위치 |
+| 모델 | 크기 | Hugging Face 공개 저장소 | 폴더 위치 |
+|---|---|---|---|
+| **기본 모델** (Qwen3-ASR 1.7B 4-bit) | 약 1.1GB | [`yeowon/qwen3_asr_1.7b_ko-MLX-4bit`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-MLX-4bit) | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit/` |
+| **Rung Ω** (정확도 우선 · 한국어 전용 출력층) | 약 2.5GB | [`yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX) | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-RungOmega-MLX/` |
+| **Rung Ω 가벼운판** (4-bit · 저메모리) | 약 1.6GB | [`yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX-lite`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-RungOmega-MLX-lite) | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-RungOmega-MLX-lite/` |
+| **문장 맞추기 (Forced Aligner)** (Rung Ω 보조) | 약 0.97GB | [`yeowon/qwen3_forced_aligner_0.6b-RungOmega-MLX`](https://huggingface.co/yeowon/qwen3_forced_aligner_0.6b-RungOmega-MLX) | `~/Library/Application Support/Talkit/models/qwen3_forced_aligner_0.6b-RungOmega-MLX/` |
+
+| 구분 | 위치 |
 |---|---|
-| 음성 인식 모델 | `~/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit/` |
 | 설정 | `~/Library/Application Support/Talkit/settings.txt` |
 | 전사 기록 | `~/Documents/Talkit/transcript_YYYY-MM-DD_HHMM.txt` |
 
-- 모델 원본: Hugging Face [`yeowon/qwen3_asr_1.7b_ko-MLX-4bit`](https://huggingface.co/yeowon/qwen3_asr_1.7b_ko-MLX-4bit) (공개)
 - 인터넷이 안 되는 Mac에는 다른 Mac에서 받아 위 폴더에 그대로 넣으면 됩니다. 폴더 안에 `model.safetensors`, `config.json` 등이 바로 있어야 합니다.
   ```bash
   hf download yeowon/qwen3_asr_1.7b_ko-MLX-4bit --local-dir "$HOME/Library/Application Support/Talkit/models/qwen3_asr_1.7b_ko-MLX-4bit"
   ```
 - 모델 폴더를 다른 곳에 두려면 환경 변수 `TALKIT_MODELS_DIR`로 바꿀 수 있습니다.
 
-### 모델 관리 화면 (1.3.0부터)
+### 모델 관리 화면 (1.3.0 ~ 1.4.0)
 
-위쪽 **모델** 버튼을 누르면 모델 상태를 보고 관리할 수 있습니다. 모델이 없으면 앱을 켤 때 이 화면이 자동으로 뜨고 내려받기를 시작합니다.
+위쪽 **모델** 버튼을 누르면 지금 쓰는 모델 이름이 보이며, 모델마다 카드에서 바로 선택·내려받기·관리를 할 수 있습니다.
 
+- **이 모델 쓰기** (받지 않은 모델이면 필요한 모델을 차례로 내려받은 뒤 자동으로 듣기 시작)
+- **Rung Ω에 문장 맞추기 켜기/끄기** (Forced Aligner 결합)
 - 진행 막대(%), **내려받기 멈추기**, **이어서 받기**(끊긴 곳부터), **다시 시도**
 - **폴더 열기**(Finder), **모델 지우기**
-- 다 받으면 듣기를 저절로 시작합니다.
 
 ### 자동 업데이트 (1.3.0부터)
 
@@ -270,12 +276,12 @@ gh release create v1.3.1 Talkit-1.3.1.dmg --repo muzuksazo/desktop-recorder --ti
 ### DMG 만들기 (개발자)
 
 ```bash
-packaging/package_macos.sh                      # 기본 버전
-VERSION=1.2.1 BUILD=8 packaging/package_macos.sh
+packaging/package_macos.sh                      # 기본 버전 (1.4.0)
+VERSION=1.4.0 BUILD=10 packaging/package_macos.sh
 ```
 
-- 외부 배포판(DMG)은 `edition.txt = public` 이 들어가 **공개 4-bit 모델만** 씁니다.
-- 비공개 엔진은 소스에서 실행하는 개발용 앱에서만 쓰며, 저장소와 DMG 어디에도 들어가지 않습니다.
+- 외부 배포판(DMG)은 `edition.txt = public` 이 들어가 개발자 Mac의 로컬 작업 폴더를 참조하지 않고, 공개 Hugging Face 모델 4종(`기본 4-bit`, `Rung Ω`, `Rung Ω 가벼운판`, `문장 맞추기`)을 내려받아 사용합니다.
+- 추론 전용 런타임(`rung_runtime.py`)만 포함되며 양자화 알고리즘 코드는 저장소와 DMG 어디에도 들어가지 않습니다.
 
 ---
 
