@@ -1,5 +1,34 @@
-> 📢 **Talkit for Windows 공개** — Mac 앱 Talkit 1.2.0의 Windows 판입니다. [Releases](https://github.com/muzuksazo/desktop-recorder/releases)에서 `Talkit.exe`를 받아 실행하세요 (모델 받기·양자화·자동 업데이트 포함).
-> 설치·기능은 아래 [Talkit for Windows](#talkit-for-windows-windows_apppy) 절을 보세요.
+> 📢 **Talkit 1.4.1 (Mac & Windows)** — 별도 Python·개발 환경 설치 없이 운영체제에 맞는 설치 파일만 받아 실행하면 됩니다. 앱이 현재 Mac/PC 사양(칩·메모리·GPU)을 자동으로 감지해 가장 알맞은 모델을 추천하고 내려받습니다.
+
+## 내 시스템에 맞는 설치 파일 & 모델 추천
+
+### 1. 운영체제별 설치 파일 ([GitHub Releases](https://github.com/muzuksazo/desktop-recorder/releases))
+
+| 운영체제 | 받을 파일 | 설치 및 첫 실행 |
+|---|---|---|
+| **macOS** (Apple Silicon: M1 / M2 / M3 / M4, macOS 13+) | **`Talkit-1.4.1.dmg`** (`v1.4.1` 릴리스) | DMG를 열고 `Talkit.app`을 `Applications`로 끌어다 놓은 뒤 실행 (Python·MLX 런타임 내장, 별도 설치 없음) |
+| **Windows 10 / 11** (64-bit) | **`Talkit.exe`** (`win-v…` 릴리스) | `Talkit.exe` 실행 → 설정 창에서 **엔진 설치** 1회 클릭 (GPU 유무를 자동 감지해 CUDA 또는 CPU 엔진 설치) |
+
+> 💡 **Intel Mac 안내**: Mac 앱(`Talkit.dmg`)은 Apple Silicon(MLX 가속) 전용입니다.
+
+### 2. Mac 사양별 추천 모델 (앱 안 `[모델]` 화면에서 자동 감지·추천)
+
+| 내 Mac 통합 메모리 | 자동 추천 조합 | 모델 크기 | 특징 |
+|---|---|---|---|
+| **8GB** (M1 / M2 / M3 기본형) | **기본 모델** (`public`) | 1.1GB | 가장 가볍고 빠름 · 다른 앱과 함께 켜도 메모리 여유 |
+| **16GB ~ 18GB** (Pro / Air 16GB) | **Rung Ω 가벼운판** 또는 **Rung Ω** | 1.6GB / 2.5GB | 한국어 전용 출력층으로 정확도 향상 · 16GB에서 쾌적 |
+| **24GB 이상** (Pro / Max / Ultra) | **Rung Ω + 문장 맞추기 (Forced Aligner)** | 2.5GB + 0.97GB | 최고 정확도 + 단어 시각 정렬로 문장 끝 잘림·유령 단어 최소화 |
+
+### 3. Windows PC 사양별 추천 모델·양자화 (`설정` 창에서 자동 감지·추천)
+
+| 내 PC 그래픽카드 / RAM | 자동 추천 모델 | 추천 정밀도 (양자화) | 특징 |
+|---|---|---|---|
+| **NVIDIA GPU 6GB 이상** (RTX 3060 / 4060 / 4070 등) | **한국어 1.7B** (`ko-1.7b`) | **원본 (bf16)** 또는 **4-bit 저장** | 가장 빠르고 정확함 (`4-bit 저장` 시 불러오기 9초·메모리 1.6GB) |
+| **NVIDIA GPU 4GB** (GTX 1650 / RTX 3050 4GB 등) | **한국어 1.7B** (`ko-1.7b`) | **4-bit (nf4)** | GPU 메모리를 1/3만 쓰면서 원래 속도 유지 |
+| **NVIDIA GPU 없음 · RAM 16GB 이상** | **한국어 1.7B** 또는 **Qwen 공식 0.6B** | **CPU 8-bit** | CPU 8-bit 가속으로 GPU 없이도 실시간 전사 가능 |
+| **NVIDIA GPU 없음 · RAM 8GB 이하** | **Qwen 공식 0.6B** (`qwen-0.6b`) | **CPU 8-bit** | 1.9GB 가벼운 모델로 저사양 노트북에서도 가볍게 동작 |
+
+---
 
 # 실시간 한국어 강의 전사 (1시간 MVP)
 

@@ -92,6 +92,92 @@ pub fn required_models(choice: &str) -> &'static [&'static str] {
     CHOICES.iter().find(|c| c.0 == choice).map(|c| c.2).unwrap_or(&["public"])
 }
 
+/// 이 Mac 의 칩 이름과 통합 메모리(GB)를 바탕으로 알맞은 모델을 추천한다
+#[derive(Clone, Debug)]
+pub struct SystemInfo {
+    pub chip: String,
+    pub ram_gb: u64,
+}
+
+impl SystemInfo {
+    /// 메모리에 따라 가장 알맞은 CHOICES 항목 id
+    pub fn recommended_choice(&self) -> &'static str {
+        if self.ram_gb <= 8 {
+            "public"
+        } else if self.ram_gb <= 18 {
+            "rung-omega-lite"
+        } else {
+            "rung-omega-fa"
+        }
+    }
+
+    /// 모델 카드에 '이 Mac 추천' 배지를 붙일 모델 id 들
+    pub fn recommended_models(&self) -> &'static [&'static str] {
+        if self.ram_gb <= 8 {
+            &["public"]
+        } else if self.ram_gb <= 18 {
+            &["rung-omega-lite", "rung-omega"]
+        } else {
+            &["rung-omega", "fa"]
+        }
+    }
+
+    pub fn is_recommended(&self, model_id: &str) -> bool {
+        self.recommended_models().contains(&model_id)
+    }
+
+    /// 모델 화면 맨 위에 보여 줄 한 줄 안내
+    pub fn summary_line(&self) -> String {
+        if self.ram_gb <= 8 {
+            format!(
+                "이 Mac ({} · {}GB) → 가볍고 빠른 '기본 모델(1.1GB)'을 추천해요",
+                self.chip, self.ram_gb
+            )
+        } else if self.ram_gb <= 18 {
+            format!(
+                "이 Mac ({} · {}GB) → 'Rung Ω 가벼운판(1.6GB)' 또는 'Rung Ω(2.5GB)'를 추천해요",
+                self.chip, self.ram_gb
+            )
+        } else {
+            format!(
+                "이 Mac ({} · {}GB) → 가장 정확한 'Rung Ω + 문장 맞추기' 조합을 추천해요",
+                self.chip, self.ram_gb
+            )
+        }
+    }
+
+    /// 메모리가 적은 Mac 에서 큰 모델을 볼 때 띄울 안내
+    pub fn memory_warning(&self, model_id: &str) -> Option<&'static str> {
+        if self.ram_gb <= 8 {
+            match model_id {
+                "rung-omega" => Some("8GB Mac 에서는 다른 앱과 함께 쓸 때 메모리가 빡빡할 수 있어요. '기본 모델'이나 'Rung Ω 가벼운판'을 권장합니다."),
+                "fa" => Some("8GB Mac 에서는 Rung Ω 와 함께 켜면(총 3.5GB) 메모리가 부족할 수 있어요."),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+fn sysctl_str(key: &str) -> Option<String> {
+    let out = Command::new("/usr/sbin/sysctl").args(["-n", key]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+pub fn detect_system() -> SystemInfo {
+    let chip = sysctl_str("machdep.cpu.brand_string").unwrap_or_else(|| "Apple Silicon".into());
+    let ram_gb = sysctl_str("hw.memsize")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|bytes| ((bytes + (1 << 29)) >> 30).max(1))
+        .unwrap_or(16);
+    SystemInfo { chip, ram_gb }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum ModelState {
     Installed { path: PathBuf, bytes: u64, legacy: bool },
@@ -538,6 +624,26 @@ mod tests {
     fn notes_bullets() {
         let n = "## T\n### 새로 바뀐 것\n- **고침** 하나\n- 둘\n### 설치\n1. x";
         assert_eq!(short_notes(n, 3), vec!["고침 하나".to_string(), "둘".to_string()]);
+    }
+
+    #[test]
+    fn system_recommendations() {
+        let m8 = SystemInfo { chip: "Apple M1".into(), ram_gb: 8 };
+        assert_eq!(m8.recommended_choice(), "public");
+        assert!(m8.is_recommended("public"));
+        assert!(!m8.is_recommended("rung-omega"));
+        assert!(m8.memory_warning("rung-omega").is_some());
+
+        let m16 = SystemInfo { chip: "Apple M1 Pro".into(), ram_gb: 16 };
+        assert_eq!(m16.recommended_choice(), "rung-omega-lite");
+        assert!(m16.is_recommended("rung-omega-lite"));
+        assert!(m16.is_recommended("rung-omega"));
+        assert!(m16.memory_warning("rung-omega").is_none());
+
+        let m32 = SystemInfo { chip: "Apple M3 Max".into(), ram_gb: 36 };
+        assert_eq!(m32.recommended_choice(), "rung-omega-fa");
+        assert!(m32.is_recommended("rung-omega"));
+        assert!(m32.is_recommended("fa"));
     }
 }
 

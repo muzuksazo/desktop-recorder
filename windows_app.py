@@ -940,6 +940,8 @@ class SettingsWindow:
                    muted=True)
 
         self.section("모델")
+        rec_id, rec_summary = tw.recommend_for_pc()
+        self.label(self.row(), f"💡 {rec_summary}")
         models = tw.installed_models()
         cur = self.app.model_path()
         self.model_var = tk.StringVar(value=cur or "")
@@ -952,11 +954,14 @@ class SettingsWindow:
         have = {os.path.basename(p) for _, p in models}
         for m in tw.MODELS:
             r = self.row()
-            self.label(r, f"• {m['label']}  {m['gb']}GB", muted=True)
+            is_rec = m["id"] == rec_id
+            badge = "  [이 PC 추천]" if is_rec else ""
+            self.label(r, f"• {m['label']}  {m['gb']}GB{badge}", muted=not is_rec)
             if m["folder"] in have:
                 self.label(r, "받음", muted=True, side="right")
             else:
-                pill(r, "받기", lambda m=m: self.do_download(m["repo"], m["folder"])).pack(side="right")
+                pill(r, "추천 받기" if is_rec else "받기",
+                     lambda m=m: self.do_download(m["repo"], m["folder"]), primary=is_rec).pack(side="right")
         r = self.row()
         pill(r, "다른 모델 받기 (Hugging Face 주소)", self.ask_download).pack(side="left")
 

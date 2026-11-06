@@ -1167,6 +1167,7 @@ struct TranscriptView {
     history_copied: Option<usize>,
     history_scroll: ScrollHandle,
     /// 공개 모델 상태와 내려받는 프로세스
+    sys_info: updates::SystemInfo,
     model_states: HashMap<&'static str, ModelState>,
     /// 지금 받고 있는 모델 id (한 번에 하나)
     downloading: Option<&'static str>,
@@ -1197,6 +1198,24 @@ impl TranscriptView {
             wave_history.push_back(0.08);
         }
 
+        let sys_info = updates::detect_system();
+        let model_states = scan_all_models();
+        let saved_model = read_setting("model").unwrap_or_default();
+        let model_choice = if !saved_model.is_empty() {
+            saved_model
+        } else {
+            // 처음 실행: 이미 받아 둔 모델이 있으면 바로 쓰고, 하나도 없으면 이 Mac 사양 추천 조합을 고른다
+            let rec = sys_info.recommended_choice();
+            let any_installed = ["rung-omega-fa", "rung-omega", "rung-omega-lite", "public"]
+                .into_iter()
+                .find(|c| {
+                    updates::required_models(c)
+                        .iter()
+                        .all(|id| matches!(model_states.get(id), Some(ModelState::Installed { .. })))
+                });
+            any_installed.unwrap_or(rec).to_string()
+        };
+
         let mut view = Self {
             preset: GlassPreset::TalkitLight,
             glass_initialized: false,
@@ -1221,7 +1240,7 @@ impl TranscriptView {
             follow_tail: true,
             source_mode: load_source_mode(),
             models: Vec::new(),
-            model_choice: read_setting("model").unwrap_or_default(),
+            model_choice,
             backend_gen: 0,
             save_path: None,
             view_mode: ViewMode::Live,
@@ -1229,7 +1248,8 @@ impl TranscriptView {
             history_detail: None,
             history_copied: None,
             history_scroll: ScrollHandle::new(),
-            model_states: scan_all_models(),
+            sys_info,
+            model_states,
             downloading: None,
             dl_gen: 0,
             _downloader: None,
@@ -2708,6 +2728,9 @@ impl TranscriptView {
             _ => None,
         };
 
+        let is_rec = self.sys_info.is_recommended(id);
+        let mem_warn = self.sys_info.memory_warning(id);
+
         div()
             .flex()
             .flex_col()
@@ -2737,6 +2760,7 @@ impl TranscriptView {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_2()
                                     .text_size(px(13.5))
@@ -2752,6 +2776,19 @@ impl TranscriptView {
                                                 .text_color(rgba(0xffffffff))
                                                 .child("사용 중"),
                                         )
+                                    })
+                                    .when(is_rec, |d| {
+                                        d.child(
+                                            div()
+                                                .px_2()
+                                                .rounded(px(999.0))
+                                                .bg(rgba(0x10b98122))
+                                                .border_1()
+                                                .border_color(rgba(0x10b98166))
+                                                .text_size(px(10.0))
+                                                .text_color(rgba(0x10b981ff))
+                                                .child("이 Mac 추천"),
+                                        )
                                     }),
                             )
                             .child(
@@ -2759,7 +2796,15 @@ impl TranscriptView {
                                     .text_size(px(11.0))
                                     .text_color(rgba(theme.text_muted))
                                     .child(spec.desc),
-                            ),
+                            )
+                            .when_some(mem_warn, |d, warn| {
+                                d.child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .text_color(rgba(0xd97706ff))
+                                        .child(warn),
+                                )
+                            }),
                     ),
             )
             .child(
@@ -2784,6 +2829,72 @@ impl TranscriptView {
     /// 음성 인식 모델 관리 화면: 모델마다 카드 한 장
     fn render_model_panel(&self, is_compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.preset.theme();
+        let rec_choice = self.sys_info.recommended_choice();
+        let rec_label = updates::CHOICES
+            .iter()
+            .find(|c| c.0 == rec_choice)
+            .map(|c| c.1)
+            .unwrap_or("기본 모델");
+        let rec_ready = updates::required_models(rec_choice)
+            .iter()
+            .all(|id| self.is_installed(id));
+        let rec_active = self.model_choice == rec_choice && rec_ready;
+
+        let rec_banner = div()
+            .flex_none()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded(px(14.0))
+            .bg(rgba(0x4f6bff1a))
+            .border_1()
+            .border_color(rgba(0x4f6bff4d))
+            .child(icon_svg("icons/sparkles.svg", 13.0, TALKIT_BLUE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(160.0))
+                    .text_size(px(11.5))
+                    .text_color(rgba(theme.text_primary))
+                    .child(SharedString::from(self.sys_info.summary_line())),
+            )
+            .when(rec_active, |d| {
+                d.child(
+                    div()
+                        .px_2p5()
+                        .py(px(2.0))
+                        .rounded(px(999.0))
+                        .bg(rgba(0x10b98122))
+                        .border_1()
+                        .border_color(rgba(0x10b98166))
+                        .text_size(px(10.5))
+                        .text_color(rgba(0x10b981ff))
+                        .child("추천 조합 사용 중"),
+                )
+            })
+            .when(!rec_active && (rec_ready || self.downloading.is_none()), |d| {
+                let btn_label = if rec_ready {
+                    format!("추천({rec_label}) 바로 쓰기")
+                } else {
+                    format!("추천({rec_label}) 받기")
+                };
+                d.child(
+                    self.pill_btn("use-recommended-model", true)
+                        .child(icon_svg(
+                            if rec_ready { "icons/check.svg" } else { "icons/download.svg" },
+                            11.5,
+                            0xffffffff,
+                        ))
+                        .child(SharedString::from(btn_label))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_model(rec_choice.to_string(), cx);
+                        })),
+                )
+            });
+
         let header = div()
             .flex_none()
             .flex()
@@ -2814,6 +2925,7 @@ impl TranscriptView {
             .gap_2()
             .overflow_y_scroll()
             .child(header)
+            .child(rec_banner)
             .children(updates::MODELS.iter().map(|spec| self.render_model_card(spec, is_compact, cx)))
             .child(
                 div()

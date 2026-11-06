@@ -94,6 +94,58 @@ def auto_quant():
     return "none" if g[1] >= 6000 else "nf4"
 
 
+def system_ram_gb():
+    """시스템 전체 RAM (GB). Windows GlobalMemoryStatusEx 로 읽고 실패하면 16."""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX(dwLength=ctypes.sizeof(MEMORYSTATUSEX))
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return max(1, round(stat.ullTotalPhys / (1024 ** 3)))
+    except Exception:
+        pass
+    return 16
+
+
+def recommend_for_pc():
+    """(추천 모델 id, 한 줄 추천 안내) 반환"""
+    g = nvidia_gpu()
+    ram = system_ram_gb()
+    if g is not None:
+        vram_gb = round(g[1] / 1024)
+        if g[1] >= 6000:
+            return (
+                "ko-1.7b",
+                f"이 PC ({g[0]} {vram_gb}GB · RAM {ram}GB) → '한국어 1.7B' + 원본(bf16) 또는 4-bit 저장을 추천해요",
+            )
+        return (
+            "ko-1.7b",
+            f"이 PC ({g[0]} {vram_gb}GB · RAM {ram}GB) → '한국어 1.7B' + 4-bit 양자화를 추천해요",
+        )
+    if ram >= 16:
+        return (
+            "ko-1.7b",
+            f"이 PC (NVIDIA GPU 없음 · RAM {ram}GB) → '한국어 1.7B'(CPU 8-bit) 또는 빠른 'Qwen 공식 0.6B'를 추천해요",
+        )
+    return (
+        "qwen-0.6b",
+        f"이 PC (NVIDIA GPU 없음 · RAM {ram}GB) → 가볍고 빠른 'Qwen 공식 0.6B(1.9GB)' + CPU 8-bit를 추천해요",
+    )
+
+
 # ---------------------------------------------------------------- 엔진 (Python + 패키지)
 def engine_python():
     if os.environ.get("RECORDER_PYTHON"):
