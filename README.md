@@ -1,4 +1,4 @@
-> 📢 **Talkit for Windows 공개** — Mac 앱 Talkit 1.2.0의 Windows 판입니다. `python windows_app.py` 로 실행하세요.
+> 📢 **Talkit for Windows 공개** — Mac 앱 Talkit 1.2.0의 Windows 판입니다. [Releases](https://github.com/muzuksazo/desktop-recorder/releases)에서 `Talkit.exe`를 받아 실행하세요 (모델 받기·양자화·자동 업데이트 포함).
 > 설치·기능은 아래 [Talkit for Windows](#talkit-for-windows-windows_apppy) 절을 보세요.
 
 # 실시간 한국어 강의 전사 (1시간 MVP)
@@ -310,12 +310,56 @@ Rust 빌드가 필요 없어서 스마트 앱 컨트롤이 켜진 Windows에서�
         └── TTS: PowerShell System.Speech (Microsoft Heami)
 ```
 
-### 처음 한 번
-1. Python 3.11 이상, `pip install -r requirements.txt`
-2. NVIDIA GPU가 있으면 https://pytorch.org 에서 CUDA 버전 torch로 다시 설치 (없으면 CPU로 돌지만 느림)
-3. 모델: `../qwen3_asr_1.7b_ko` 폴더에 받아 두면 그걸 쓰고, 없으면 첫 실행 때 Hugging Face에서 내려받습니다.
+### exe로 쓰기 (권장, Python 설치 필요 없음)
+1. [Releases](https://github.com/muzuksazo/desktop-recorder/releases)에서 `win-v…` 릴리스의 **`Talkit.exe`**(약 13MB)를 받아 실행합니다.
+   - "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행** (서명 인증서가 없어서 뜹니다).
+2. 처음 켜면 설정 창이 열립니다. **엔진 설치**를 누릅니다 (Python 3.14.7 + torch + qwen-asr 를 `%LOCALAPPDATA%\Talkit\runtime`에 설치. GPU 있으면 약 4GB, 없으면 약 1GB, 10~30분).
+   - NVIDIA GPU가 있으면 CUDA 판, 없으면 CPU 판 torch를 저절로 고릅니다.
+3. **모델 받기**: 한국어 1.7B(기본) / Qwen 공식 1.7B / Qwen 공식 0.6B(가벼움) 중에서 받습니다. `다른 모델 받기`로 Hugging Face 주소를 적어 받을 수도 있습니다.
+4. 받으면 바로 전사가 시작됩니다. 다음부터는 exe만 켜면 됩니다.
 
-### 실행
+| 위치 | 내용 |
+|---|---|
+| `%LOCALAPPDATA%\Talkit\runtime` | 전사 엔진 (Python + 패키지) |
+| `%LOCALAPPDATA%\Talkit\models` | 받은 모델, 양자화해서 저장한 모델 |
+| `%LOCALAPPDATA%\Talkit\app` | exe 안의 엔진 스크립트 (버전이 바뀔 때마다 새로 풀림) |
+| `문서\Talkit` | 전사 기록 txt |
+| `%APPDATA%\Talkit\settings.txt` | 설정 (입력, 모델, 양자화, 따라가기 …) |
+
+### 양자화 (설정 → 양자화)
+모델을 불러올 때의 정밀도를 고릅니다. **자동**은 GPU 6GB 이상이면 원본, 그보다 작으면 4-bit, GPU가 없으면 CPU 8-bit.
+"고른 모델을 4-bit로 저장"을 누르면 양자화한 모델을 따로 저장해 두고 다음부터 그걸 바로 불러옵니다.
+
+측정 (2026-11-06, RTX 4070 Laptop 8GB / 같은 노트북 CPU, 한국어 12초 음성 한 번에 전사, 결과 글자는 모두 같음):
+
+| 방식 | 메모리 | 전사 시간 | 불러오기 |
+|---|---|---|---|
+| GPU 원본 bf16 | 4.2GB (GPU) | 8.2초 | 23초 |
+| GPU 8-bit | 2.5GB (GPU) | 43.1초 ⚠ 느림 | 39초 |
+| GPU 4-bit | 1.6GB (GPU) | 7.3초 | 28초 |
+| **GPU 4-bit 저장본** (4.7GB → 1.5GB) | 1.6GB (GPU) | 3.5초 | **9초** |
+| CPU 원본 fp32 | 5.2GB (RAM) | 35.3초 | 15초 |
+| **CPU 8-bit** | 6.8GB (RAM, 불러올 때 최고치) | **7.4초** | 41초 |
+
+- GPU 없는 PC는 **CPU 8-bit**가 원본보다 4.8배 빠릅니다(12초 음성을 7초에 → 실시간으로 따라감). 더 느린 CPU면 0.6B 모델을 쓰세요.
+- 4-bit/8-bit 저장본은 bitsandbytes 형식이라 NVIDIA GPU에서만 불러옵니다.
+
+### 자동 업데이트
+- 켤 때 GitHub 릴리스에서 `win-v…` 태그의 새 `Talkit.exe`가 있는지 확인합니다 (설정에서 끌 수 있음). 있으면 위에 **새 버전** 버튼이 뜹니다.
+- 업데이트를 누르면 새 exe를 받아 지금 exe 옆에 두고, 앱이 꺼지면 바꿔 끼운 뒤 다시 켭니다. 엔진이 쓰는 패키지 목록이 바뀐 버전이면 다시 '엔진 설치'를 안내합니다.
+
+### exe 만들기·배포 (개발자)
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1     # → dist\Talkit.exe
+gh release create win-v1.0.0 dist\Talkit.exe --title "Talkit for Windows 1.0.0"
+```
+- 버전은 `talkit_win.py`의 `APP_VERSION`. 올린 뒤 태그를 `win-v<버전>`으로, 첨부 파일 이름을 `Talkit.exe`로 해야 자동 업데이트가 찾습니다.
+- 엔진 패키지는 `packaging/requirements-windows.txt`에 고정 (torch·bitsandbytes는 GPU 유무에 따라 따로 설치).
+
+### 소스에서 실행 (개발용)
+1. Python 3.11 이상, `pip install -r requirements.txt` (GPU면 CUDA 판 torch, 양자화하려면 `bitsandbytes`)
+2. 모델: `../qwen3_asr_1.7b_ko` 폴더에 받아 두면 그걸 쓰고, 설정 창에서 받을 수도 있습니다.
+
 ```powershell
 python windows_app.py                        # 지난번 입력 설정으로 (처음엔 마이크 + 시스템 소리)
 python windows_app.py --source system --topmost --auto-read
@@ -337,7 +381,8 @@ python windows_app.py --input-wav a.wav      # 녹음 대신 파일로 시험
 | 문장 단위로 나눠 보기 | ✅ |
 | 끌어서 복사, 전체복사, 비우기 | ✅ 끌어서 복사하면 시각·출처 없이 문장만 |
 | TTS (전사 결과 읽기) | ✅ Windows 판에만 있음 |
-| 설치 파일 (Python 포함) | ❌ 아직 없음 — Python 설치 필요 |
+| 설치 파일 | ✅ `Talkit.exe` (엔진·모델은 처음 실행 때 앱 안에서 설치) |
+| 모델 받기 · 양자화 · 자동 업데이트 | ✅ Windows 판에만 있음 (아래 참고) |
 
 - 설정은 `%APPDATA%\Talkit\settings.txt`에 기억합니다 (입력, 따라가기, 자동 읽기, 항상 위).
 - 강의 소리 파일은 저장하지 않습니다. 전사된 글만 남습니다 (Mac 판과 같음).

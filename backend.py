@@ -367,6 +367,8 @@ def main():
     p.add_argument("--pause", type=float, default=0.6, help="이만큼(초) 조용하면 문장 끝 (기본 0.6)")
     p.add_argument("--max-seg", type=float, default=15.0, help="한 번에 전사할 최대 길이(초, 기본 15)")
     p.add_argument("--use-vad", action="store_true", help="Silero VAD 문장 단위 모드 강제 사용")
+    p.add_argument("--quant", default=None,
+                   help="Windows/VAD 경로 양자화: auto / none / int8 / nf4 / cpu-int8 (model_tool.load_asr)")
     p.add_argument("--out", default=None, help="저장할 txt 경로")
     p.add_argument("--input-wav", nargs="+", default=None,
                    help="테스트용: 녹음 대신 이 wav 들(16kHz mono)을 실시간 속도로 흘려 넣는다")
@@ -429,7 +431,12 @@ def main():
 
     emit(type="status", msg=f"모델 로딩 중… ({args.model})")
     try:
-        model, dev = lt.load_model(args.device, args.model)
+        if args.quant and platform.system() != "Darwin":
+            # Windows 판: 양자화(8-bit/4-bit/CPU 8-bit)를 고를 수 있는 불러오기
+            from model_tool import load_asr
+            model, dev = load_asr(args.model, args.quant, args.device)
+        else:
+            model, dev = lt.load_model(args.device, args.model)
     except Exception as e:
         emit(type="error", msg=f"모델 로딩 실패: {e}")
         return 1

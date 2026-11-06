@@ -28,15 +28,19 @@ import datetime as dt
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from collections import deque
+from tkinter import messagebox, simpledialog, ttk
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LOCAL_MODEL = os.path.normpath(os.path.join(HERE, "..", "qwen3_asr_1.7b_ko"))
+import talkit_win as tw
+
+HERE = tw.APP_DIR          # backend.py 가 있는 곳 (exe 판은 %LOCALAPPDATA%\Talkit\app)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 ECHO_MARGIN = 1.0          # 메아리 판단 때 앞뒤 여유(초)
 MAX_ITEMS = 300            # 화면에 남겨 둘 문장 수
@@ -414,7 +418,12 @@ class App:
         self.studio.pack(fill="both", expand=True)
 
         self.tts = Tts(lambda ok, msg: self.ui_q.put((None, {"type": "tts_ready", "ok": ok, "msg": msg})))
+        self.update_info = None
+        self.settings_win = None
         self.start_backend()
+        if self.backend is None:
+            root.after(300, self.open_settings)  # 엔진·모델이 없으면 설정부터
+        threading.Thread(target=self.bg_check_update, daemon=True).start()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-c>", lambda e: self.copy_selection())
         self.poll()
@@ -429,6 +438,8 @@ class App:
         tk.Label(head, text="Talkit", font=(FONT, 16, "bold"), fg=BLUE, bg=WHITE).pack(side="left")
         tk.Label(head, text="  말하는 순간, 바로 텍스트로.", font=(FONT, 9), fg=MUTED, bg=WHITE).pack(side="left")
         pill(head, "미니창", self.toggle_mini).pack(side="right")
+        pill(head, "설정", self.open_settings).pack(side="right", padx=4)
+        self.update_btn = pill(head, "", self.open_settings, primary=True)  # 새 버전이 있을 때만 보임
         self.rec = tk.Label(head, font=(FONT, 10, "bold"), bg=WHITE)
         self.rec.pack(side="right", padx=10)
         self.wave = Wave(head)
@@ -515,8 +526,36 @@ class App:
     # ================================================================ 백엔드
     def start_backend(self):
         self.gen += 1
+        if not tw.engine_ready():
+            self.status = "전사 엔진이 아직 설치되지 않았어요 — 설정에서 '엔진 설치'를 눌러 주세요"
+            return
+        model = self.model_path()
+        if model is None:
+            self.status = "모델이 없어요 — 설정에서 모델을 받아 주세요"
+            return
+        tw.sync_app_files()
         args = [*self.backend_args, "--source", self.source.get(), "--out", self.out_path]
-        self.backend = start_backend(self.args.python, args, self.ui_q, self.gen)
+        if "--model" not in self.backend_args:
+            args += ["--model", model]
+        args += ["--quant", read_settings().get("quant", "auto")]
+        self.status = f"모델 불러오는 중… ({os.path.basename(model)})"
+        self.backend = start_backend(self.args.python or tw.engine_python(), args, self.ui_q, self.gen)
+
+    def model_path(self):
+        """설정에서 고른 모델 폴더. 없으면 받아 둔 첫 모델. 하나도 없으면 None"""
+        if "--model" in self.backend_args:
+            return self.backend_args[self.backend_args.index("--model") + 1]
+        want = read_settings().get("model")
+        models = tw.installed_models()
+        if want and any(p == want for _, p in models):
+            return want
+        return models[0][1] if models else None
+
+    def restart_backend(self, why):
+        self.stop_backend()
+        self.status = why
+        self.level = 0.0
+        self.start_backend()
 
     def stop_backend(self):
         if self.backend is not None and self.backend.poll() is None:
@@ -560,6 +599,12 @@ class App:
                            "body": f"⚠ 백엔드가 종료됐습니다 (코드 {m.get('code')}, 터미널 로그 확인)"})
         elif kind == "tts_ready":
             self.voice = f"음성: {m['msg']}" if m["ok"] else m["msg"]
+        elif kind == "update":
+            self.update_info = m["info"]
+            self.update_btn.config(text=f"새 버전 {m['info']['version']}")
+            self.update_btn.pack(side="right", padx=4)
+        elif kind == "call":  # 다른 스레드에서 화면을 바꿀 때
+            m["fn"]()
 
     def add_item(self, it):
         self.items.append(it)
@@ -817,25 +862,298 @@ class App:
             self.root.attributes("-topmost", self.topmost.get())
             self.dirty = True
 
+    # ================================================================ 업데이트
+    def bg_check_update(self):
+        if read_settings().get("auto_update", "1") != "1":
+            return
+        try:
+            info = tw.check_update()
+        except Exception:
+            return  # 인터넷이 없거나 GitHub 이 안 될 때는 조용히 넘어간다
+        if info:
+            self.ui_q.put((None, {"type": "update", "info": info}))
+
+    # ================================================================ 설정 창
+    def open_settings(self):
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.lift()
+            return
+        self.settings_win = SettingsWindow(self)
+
     def close(self):
         self.stop_backend()
         self.tts.close()
         self.root.destroy()
 
 
+class SettingsWindow:
+    """엔진 설치 · 모델 받기/고르기 · 양자화 · 업데이트. 오래 걸리는 일은 스레드에서 하고 진행 상황을 아래에 보여 준다."""
+
+    def __init__(self, app):
+        self.app = app
+        self.busy = False
+        w = self.win = tk.Toplevel(app.root)
+        w.title("Talkit 설정")
+        w.geometry("620x700")
+        w.configure(bg=WHITE)
+        w.attributes("-topmost", app.root.attributes("-topmost"))
+        self.body = tk.Frame(w, bg=WHITE)
+        self.body.pack(fill="x", padx=16, pady=(12, 4))
+        self.prog = ttk.Progressbar(w, mode="determinate", maximum=100)
+        self.prog.pack(fill="x", padx=16, pady=(8, 2))
+        self.log = tk.Text(w, height=9, font=("Consolas", 8), bg="#f7f8fc", fg=BLACK, bd=0, wrap="char",
+                           state="disabled")
+        self.log.pack(fill="both", expand=True, padx=16, pady=(2, 12))
+        self.draw()
+
+    # ---- 그리기
+    def section(self, title):
+        tk.Label(self.body, text=title, font=(FONT, 11, "bold"), fg=BLUE, bg=WHITE, anchor="w"
+                 ).pack(fill="x", pady=(10, 2))
+
+    def row(self):
+        f = tk.Frame(self.body, bg=WHITE)
+        f.pack(fill="x", pady=1)
+        return f
+
+    def label(self, parent, text, muted=False, side="left"):
+        tk.Label(parent, text=text, font=(FONT, 9), fg=MUTED if muted else BLACK, bg=WHITE, anchor="w",
+                 justify="left").pack(side=side)
+
+    def draw(self):
+        for c in self.body.winfo_children():
+            c.destroy()
+        st = read_settings()
+        gpu = tw.nvidia_gpu()
+        ready = tw.engine_ready()
+
+        self.section("전사 엔진")
+        r = self.row()
+        if tw.FROZEN:
+            self.label(r, "설치됨 ✅" if ready else "아직 설치 안 됨 — 처음 한 번 필요 (Python + torch + qwen-asr, 몇 GB)")
+            if not ready:
+                pill(r, "엔진 설치", self.do_install, primary=True).pack(side="right")
+        else:
+            self.label(r, f"소스 실행: 지금 Python 사용 ({sys.executable})", muted=True)
+        r = self.row()
+        self.label(r, f"GPU: {gpu[0]} ({round(gpu[1] / 1024)}GB)" if gpu else "GPU: NVIDIA GPU 없음 → CPU 로 전사 (느림)",
+                   muted=True)
+
+        self.section("모델")
+        models = tw.installed_models()
+        cur = self.app.model_path()
+        self.model_var = tk.StringVar(value=cur or "")
+        if not models:
+            self.label(self.row(), "받아 둔 모델이 없어요. 아래에서 하나 받아 주세요.", muted=True)
+        for name, path in models:
+            r = self.row()
+            tk.Radiobutton(r, text=f"{name}   {tw.dir_size(path) / 1e9:.1f}GB", value=path, variable=self.model_var,
+                           command=self.on_model, bg=WHITE, activebackground=WHITE, font=(FONT, 9)).pack(side="left")
+        have = {os.path.basename(p) for _, p in models}
+        for m in tw.MODELS:
+            r = self.row()
+            self.label(r, f"• {m['label']}  {m['gb']}GB", muted=True)
+            if m["folder"] in have:
+                self.label(r, "받음", muted=True, side="right")
+            else:
+                pill(r, "받기", lambda m=m: self.do_download(m["repo"], m["folder"])).pack(side="right")
+        r = self.row()
+        pill(r, "다른 모델 받기 (Hugging Face 주소)", self.ask_download).pack(side="left")
+
+        self.section("양자화 (불러올 때의 정밀도)")
+        self.quant_var = tk.StringVar(value=st.get("quant", "auto"))
+        for val, text in tw.QUANTS:
+            if val == "auto":
+                text += f" → 지금 PC: {dict(tw.QUANTS)[tw.auto_quant()].split(' (')[0]}"
+            tk.Radiobutton(self.row(), text=text, value=val, variable=self.quant_var, command=self.on_quant,
+                           bg=WHITE, activebackground=WHITE, font=(FONT, 9),
+                           state="normal" if (gpu or val not in ("int8", "nf4")) else "disabled").pack(side="left")
+        r = self.row()
+        self.label(r, "고른 모델을 양자화해서 저장 (GPU 필요, 다음부터 빨리 불러옴):", muted=True)
+        pill(r, "8-bit 저장", lambda: self.do_quantize(8)).pack(side="right")
+        pill(r, "4-bit 저장", lambda: self.do_quantize(4)).pack(side="right", padx=4)
+
+        self.section("업데이트")
+        r = self.row()
+        self.label(r, f"지금 버전: {tw.APP_VERSION}" + ("" if tw.FROZEN else " (소스 실행 — git pull 로 업데이트)"))
+        info = self.app.update_info
+        if info:
+            pill(r, f"{info['version']} 로 업데이트", self.do_update, primary=True).pack(side="right")
+            pill(r, "바뀐 점", lambda: webbrowser.open(info["page"])).pack(side="right", padx=4)
+        else:
+            pill(r, "지금 확인", self.do_check).pack(side="right")
+        self.auto_upd = tk.BooleanVar(value=st.get("auto_update", "1") == "1")
+        check(self.row(), "켤 때 새 버전 확인", self.auto_upd,
+              lambda: write_setting("auto_update", int(self.auto_upd.get()))).pack(side="left")
+
+    # ---- 진행 상황 (다른 스레드에서 불러도 됨)
+    def say(self, msg):
+        def f():
+            if not self.win.winfo_exists():
+                return
+            self.log.config(state="normal")
+            self.log.insert("end", msg + "\n")
+            self.log.see("end")
+            self.log.config(state="disabled")
+            m = re.search(r"(\d+)%", msg)
+            if m:
+                self.prog.config(value=int(m.group(1)))
+        self.app.ui_q.put((None, {"type": "call", "fn": f}))
+
+    def progress(self, done, total):
+        def f():
+            if self.win.winfo_exists():
+                self.prog.config(value=done * 100 / total if total else 0)
+        self.app.ui_q.put((None, {"type": "call", "fn": f}))
+
+    def job(self, name, fn, after=None):
+        if self.busy:
+            messagebox.showinfo("Talkit", "다른 작업이 끝날 때까지 기다려 주세요.", parent=self.win)
+            return
+        self.busy = True
+        self.prog.config(value=0)
+        self.say(f"▶ {name}")
+
+        def run():
+            ok = True
+            try:
+                fn()
+            except Exception as e:
+                ok = False
+                self.say(f"✗ {name} 실패: {e}")
+            finally:
+                self.busy = False
+
+            def end():
+                if self.win.winfo_exists():
+                    self.draw()
+                if ok and after:
+                    after()
+            self.app.ui_q.put((None, {"type": "call", "fn": end}))
+        threading.Thread(target=run, daemon=True).start()
+
+    def tool(self, args):
+        """model_tool.py 실행. error 가 오면 예외"""
+        err = []
+
+        def on(m):
+            k = m.get("type")
+            if k == "progress":
+                self.progress(m["done"], m["total"])
+                self.say(f"{m['done'] / 1e9:.2f} / {m['total'] / 1e9:.2f} GB") if int(time.time()) % 5 == 0 else None
+            elif k == "error":
+                err.append(m["msg"])
+            elif k == "done":
+                self.say("완료: " + ", ".join(f"{a}={b}" for a, b in m.items() if a != "type"))
+            else:
+                self.say(m.get("msg", str(m)))
+        code = tw.run_model_tool(args, on)
+        if err or code != 0:
+            raise RuntimeError(err[0] if err else f"종료 코드 {code}")
+
+    # ---- 동작
+    def need_engine(self):
+        if tw.engine_ready():
+            return False
+        messagebox.showinfo("Talkit", "먼저 '엔진 설치'를 해 주세요.", parent=self.win)
+        return True
+
+    def do_install(self):
+        if not messagebox.askokcancel(
+                "엔진 설치", "전사 엔진을 설치합니다.\n\nPython·torch·qwen-asr 를 내려받아 %LOCALAPPDATA%\\Talkit 에 둡니다."
+                "\nGPU 가 있으면 약 4GB, 없으면 약 1GB, 10~30분 걸립니다.", parent=self.win):
+            return
+        self.job("엔진 설치", lambda: tw.install_engine(self.say), after=self.after_change)
+
+    def do_download(self, repo, folder):
+        if self.need_engine():
+            return
+        dst = os.path.join(tw.MODELS_DIR, folder)
+        self.job(f"{repo} 받기", lambda: self.tool(["download", "--repo", repo, "--dir", dst]),
+                 after=lambda: self.pick_if_none(dst))
+
+    def ask_download(self):
+        repo = simpledialog.askstring("다른 모델 받기", "Hugging Face 모델 주소 (예: Qwen/Qwen3-ASR-0.6B)",
+                                      parent=self.win)
+        if repo and re.fullmatch(r"[\w.-]+/[\w.-]+", repo.strip()):
+            self.do_download(repo.strip(), repo.strip().split("/")[1])
+        elif repo:
+            messagebox.showwarning("Talkit", "'이름/모델' 모양으로 적어 주세요.", parent=self.win)
+
+    def do_quantize(self, bits):
+        if self.need_engine():
+            return
+        src = self.app.model_path()
+        if not src:
+            messagebox.showinfo("Talkit", "먼저 모델을 받아 주세요.", parent=self.win)
+            return
+        if not tw.nvidia_gpu():
+            messagebox.showinfo("Talkit", "양자화해서 저장하기는 NVIDIA GPU 가 필요해요.\n"
+                                "GPU 가 없으면 위에서 'CPU 8-bit' 를 고르세요 (불러올 때마다 양자화).", parent=self.win)
+            return
+        name = os.path.basename(src.rstrip("\\/"))
+        dst = os.path.join(tw.MODELS_DIR, f"{name}-{'nf4' if bits == 4 else 'int8'}")
+        if os.path.exists(dst):
+            messagebox.showinfo("Talkit", f"이미 있어요: {dst}", parent=self.win)
+            return
+        if not messagebox.askokcancel("양자화", f"{name} 을 {bits}-bit 로 양자화해 저장합니다.\n"
+                                      "GPU 메모리를 비우려고 전사를 잠깐 멈춥니다.", parent=self.win):
+            return
+        self.app.stop_backend()
+        self.app.status = "양자화하는 동안 전사를 멈췄어요"
+
+        def done():
+            write_setting("model", dst)
+            self.app.restart_backend(f"양자화한 모델로 다시 시작… ({os.path.basename(dst)})")
+        self.job(f"{bits}-bit 양자화", lambda: self.tool(["quantize", "--src", src, "--dst", dst, "--bits", str(bits)]),
+                 after=done)
+
+    def do_check(self):
+        def f():
+            info = tw.check_update()
+            self.app.update_info = info
+            self.say(f"새 버전 {info['version']} 이 있어요" if info else f"최신 버전이에요 ({tw.APP_VERSION})")
+            if info:
+                self.app.ui_q.put((None, {"type": "update", "info": info}))
+        self.job("업데이트 확인", f)
+
+    def do_update(self):
+        info = self.app.update_info
+        if not tw.FROZEN:
+            webbrowser.open(info["page"])
+            return
+
+        def after():
+            self.app.close()
+        self.job(f"{info['version']} 받기", lambda: tw.apply_update(info, self.say), after=after)
+
+    def on_model(self):
+        write_setting("model", self.model_var.get())
+        self.app.restart_backend(f"모델을 바꾸는 중… ({os.path.basename(self.model_var.get())})")
+
+    def on_quant(self):
+        write_setting("quant", self.quant_var.get())
+        self.app.restart_backend(f"정밀도를 '{dict(tw.QUANTS)[self.quant_var.get()]}'(으)로 바꾸는 중…")
+
+    def pick_if_none(self, path):
+        if not read_settings().get("model") or self.app.backend is None:
+            write_setting("model", path)
+        self.after_change()
+
+    def after_change(self):
+        if self.app.backend is None:
+            self.app.start_backend()
+
+
 def main():
     p = argparse.ArgumentParser(description="Talkit for Windows (backend.py + Windows 기본 음성)")
-    p.add_argument("--python", default=os.environ.get("RECORDER_PYTHON", sys.executable),
-                   help="backend.py 를 돌릴 Python (torch·qwen-asr 설치된 것)")
+    p.add_argument("--python", default=None,
+                   help="backend.py 를 돌릴 Python (기본: exe 판은 설치한 엔진, 소스 실행은 지금 Python)")
     p.add_argument("--source", choices=[s for s, _ in SOURCES], default=None, help="처음 입력 (기본: 지난번 설정)")
     p.add_argument("--out", default=None, help="저장할 txt (기본: 문서\\Talkit\\transcript_날짜_시각.txt)")
     p.add_argument("--topmost", action="store_true", help="창을 항상 위에")
     p.add_argument("--auto-read", action="store_true", help="처음부터 자동 읽기 켜기")
     args, backend_args = p.parse_known_args()
-
-    # 모델을 따로 안 정했으면 옆 폴더(../qwen3_asr_1.7b_ko)에 받아 둔 모델을 쓴다 (없으면 백엔드가 내려받음)
-    if "--model" not in backend_args and os.path.isdir(LOCAL_MODEL):
-        backend_args += ["--model", LOCAL_MODEL]
 
     try:  # 고해상도 화면에서 글자가 흐리지 않게
         import ctypes
